@@ -5,7 +5,7 @@
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.2.0",
+	"version": "v1.3.0",
 	"developer": "lockyexe",
 	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases",
 	"tags": [
@@ -85,6 +85,12 @@
 			"type": "bool",
 			"name": "Natural timing polish",
 			"description": "After a click is found, try moving it to a more natural spot inside the window it works in. Kept only if the run still survives. (Modes 1 and 2.)",
+			"default": true
+		},
+		"brain": {
+			"type": "bool",
+			"name": "Brain (physics lookahead)",
+			"description": "Learn the game's physics while playing and simulate ahead: click before a predicted crash, inside the timing window that's predicted to work, and try the fixes predicted to pass first. The learned physics are kept between sessions.",
 			"default": true
 		}
 	}

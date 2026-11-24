@@ -32,15 +32,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "Brain.hpp"
 #include "Humanizer.hpp"
+#include "Types.hpp"
 
 namespace pf {
-
-enum class Mode : uint8_t { Cube, Ship, Ball, Ufo, Wave, Robot, Spider, Swing };
-char const* modeName(Mode m);
-bool isFlyMode(Mode m);
-
-enum class ObjKind : uint8_t { Solid, Hazard, Orb, Pad, Portal };
 
 struct Event {
     uint64_t tick = 0;
@@ -70,6 +66,8 @@ struct TraceTick {
     bool touchingOrb = false;
     bool upsideDown = false;
     Mode mode = Mode::Cube;
+    bool mini = false;
+    float w = 30.f, h = 30.f;
 };
 
 struct Trace {
@@ -290,6 +288,15 @@ private:
     void startPolish(Segment& s);
     bool resolvePolish(Segment& s, uint64_t deathTick); // true: the death was the polish's fault
 
+    // Brain (learned physics + lookahead)
+    bool brainOn() const;
+    SimState toSim(PlayerSnap const& s, bool hold) const;
+    SimWorld simWorld(uint8_t ch, SimState const& st, float range) const;
+    std::optional<bool> brainGround(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick);
+    std::optional<bool> flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick, std::optional<bool> want);
+    void rankWithBrain(Segment& s, Cluster& c);
+    void saveModel();
+
     // Checkpoints
     bool safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t tick) const;
     bool isDoomedState(PlayerSnap const& s) const;
@@ -351,6 +358,17 @@ private:
     std::vector<uint64_t> m_skipTokens; // game respawn timers we already beat (tick counter at creation)
     uint64_t m_tickCounter = 0;         // monotonic count of physics ticks seen
     bool m_wasAliveBeforeReset = false;
+
+    // Brain
+    PhysicsModel m_model;
+    bool m_modelLoaded = false;
+    struct BrainPlan {
+        int64_t lo = -1, hi = -1, target = -1; // absolute ticks of the survival window and the chosen click
+        int len = 0;
+        uint64_t madeAt = 0;
+    };
+    BrainPlan m_brainPlan[2];
+    uint64_t m_lastGuardTick[2] = {0, 0};
 
     std::string m_status;
     int m_totalDeaths = 0;

@@ -34,6 +34,20 @@ Your own clicks are ignored while it's on (setting), so they don't end up in the
 All timings are physics ticks (240/s of game time), so it behaves the same at 1.0x or any speedhack.
 F6/F7 are read by virtual-key code, so they work on Turkish Q/F and any other layout.
 
+## Brain (v1.3)
+
+The bot learns Geometry Dash physics while it plays (gravity, jump and UFO tap strength, ship thrust, robot boost,
+terminal speeds, wave slope - per mode and size) and saves them between sessions. With that model it simulates
+ahead against the real hitboxes:
+
+- **Ground modes** (cube, robot, ball, spider): if doing nothing is predicted to crash, it finds the range of ticks
+  where a click survives and clicks at the profile's natural spot inside it - before ever dying there.
+- **Flying modes** (ship, wave, UFO, swing): a guard simulates "keep doing this" vs "switch now" and overrides the
+  corridor controller when it predicts a crash.
+- **After a death**: every candidate fix is simulated; predicted passes are tried first. The brain is only trusted
+  at a spot if it reproduces the death that actually happened there. The label shows how often it does (`Brain 87%`).
+- Orbs, pads, portals and slopes aren't simulated; there it falls back to the search.
+
 ## Speed & accuracy features (v1.2)
 
 - **Instant respawn**: skips the game's respawn delay (auto-disables if your setup doesn't support it).

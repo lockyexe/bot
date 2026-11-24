@@ -118,6 +118,8 @@ bool isFlyMode(Mode m) {
     return m == Mode::Ship || m == Mode::Ufo || m == Mode::Wave || m == Mode::Swing;
 }
 
+bool isBoundedMode(Mode m) { return isFlyMode(m) || m == Mode::Ball || m == Mode::Spider; }
+
 TraceTick const* Trace::at(uint8_t ch, uint64_t tick) const {
     if (ch > 1 || tick < base) return nullptr;
     auto idx = static_cast<size_t>(tick - base);
@@ -244,11 +246,23 @@ void Pathfinder::onLevelInit(PlayLayer* pl) {
         m_learnedCeil[c].clear();
         m_modeKnown[c] = false;
     }
+    m_brainPlan[0] = m_brainPlan[1] = {};
+    if (!m_modelLoaded) {
+        m_modelLoaded = true;
+        m_model.deserialize(Mod::get()->getSavedValue<std::string>("brain-model", ""));
+    }
     m_status = "Enter Practice Mode to start";
     (void)pl;
 }
 
+void Pathfinder::saveModel() {
+    if (m_model.samples() > 0) Mod::get()->setSavedValue<std::string>("brain-model", m_model.serialize());
+}
+
+bool Pathfinder::brainOn() const { return settingBool("brain"); }
+
 void Pathfinder::onLevelExit() {
+    saveModel();
     m_inLevel = false;
     m_segments.clear();
     m_doomed.clear();
@@ -349,6 +363,8 @@ void Pathfinder::onReset(PlayLayer* pl) {
         m_lastPress[c] = -100000;
         m_assistHold[c] = 0;
         m_vySmooth[c] = 0.f;
+        m_brainPlan[c] = {};
+        m_lastGuardTick[c] = 0;
     }
     m_deathHandled = false;
     m_divergedThisAttempt = false;
@@ -575,13 +591,14 @@ void Pathfinder::updateBounds(uint8_t ch, PlayerSnap const& s) {
     if (!m_modeKnown[ch] || m_prevMode[ch] != s.mode) {
         m_modeKnown[ch] = true;
         m_prevMode[ch] = s.mode;
-        if (isFlyMode(s.mode)) {
+        if (isBoundedMode(s.mode)) {
+            float height = isFlyMode(s.mode) ? 300.f : 240.f; // ball/spider sections are 8 blocks
             float snapped = std::round(s.y / 30.f) * 30.f;
-            m_modeFloor[ch] = std::max(90.f, snapped - 150.f);
-            m_modeCeil[ch] = m_modeFloor[ch] + 300.f;
+            m_modeFloor[ch] = std::max(90.f, snapped - height * 0.5f);
+            m_modeCeil[ch] = m_modeFloor[ch] + height;
         }
     }
-    if (!isFlyMode(s.mode)) return;
+    if (!isBoundedMode(s.mode)) return;
     // Sliding on an invisible bound with no block involved: that is the
     // real floor/ceiling. Learn it for this part of the level.
     if (s.onGround && !solidContact(s)) {
@@ -704,7 +721,8 @@ std::optional<bool> Pathfinder::livePolicy(PlayLayer* pl, uint8_t ch, PlayerSnap
         return std::nullopt;
     }
     if (m_tapReleaseAt[ch] >= 0) return std::nullopt; // mid-tap
-    if (isFlyMode(s.mode)) return flyController(pl, ch, s, tick);
+    if (isFlyMode(s.mode)) return flyGuard(pl, ch, s, tick, flyController(pl, ch, s, tick));
+    if (brainOn()) return brainGround(pl, ch, s, tick);
     return groundAssist(s, ch, tick);
 }
 
@@ -907,10 +925,34 @@ void Pathfinder::onTick(PlayLayer* pl) {
             press(pl, ch, *want, tick, true);
         }
 
+        // Learn the game's physics from what just happened.
+        if (m_havePrevY[ch] && tick > 0) {
+            if (auto prev = m_trace.at(ch, tick - 1)) {
+                if (prev->mode == s.mode && prev->mini == s.mini && prev->upsideDown == s.upsideDown &&
+                    !prev->touchingOrb && !orb) {
+                    int64_t since = static_cast<int64_t>(tick) - m_lastPress[ch];
+                    int tsp = since > 1000 ? 1000 : static_cast<int>(since);
+                    m_model.observe(s.mode, s.mini, s.upsideDown, prev->hold, prev->onGround, s.onGround, prev->vy,
+                                    s.vy, s.vx, tsp);
+                }
+            }
+        }
+
         auto& tr = m_trace.ticks[ch];
         if (tick >= m_trace.base) {
             auto idx = static_cast<size_t>(tick - m_trace.base);
-            TraceTick tt{s.x, s.y, s.vy, s.onGround, m_hold[ch], orb, s.upsideDown, s.mode};
+            TraceTick tt;
+            tt.x = s.x;
+            tt.y = s.y;
+            tt.vy = s.vy;
+            tt.onGround = s.onGround;
+            tt.hold = m_hold[ch];
+            tt.touchingOrb = orb;
+            tt.upsideDown = s.upsideDown;
+            tt.mode = s.mode;
+            tt.mini = s.mini;
+            tt.w = s.rect.size.width;
+            tt.h = s.rect.size.height;
             if (idx <= 200000) {
                 while (tr.size() < idx) tr.push_back(tr.empty() ? tt : tr.back());
                 if (tr.size() == idx) tr.push_back(tt);
@@ -1312,6 +1354,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
     if (out.size() > 400) out.resize(400);
     c.queue = std::move(out);
     c.next = 0;
+    rankWithBrain(s, c);
     reprioritize(c);
 }
 
@@ -1711,6 +1754,7 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     if (!m_inLevel || !active(pl) || m_deathHandled) return;
     m_deathHandled = true;
     m_totalDeaths++;
+    if (m_totalDeaths % 50 == 0) saveModel();
     m_fastForward = false;
     if (settingBool("instant-respawn") && !m_fastRespawnBroken) {
         m_respawnPending = true;
@@ -1810,6 +1854,259 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     startPolish(s);
 }
 
+
+// ---------------------------------------------------------------------------
+// brain: learned physics + lookahead
+// ---------------------------------------------------------------------------
+
+SimState Pathfinder::toSim(PlayerSnap const& s, bool hold) const {
+    SimState st;
+    st.x = s.x;
+    st.y = s.y;
+    st.vy = s.vy;
+    st.vx = s.vx;
+    st.w = s.rect.size.width > 0.f ? s.rect.size.width : 30.f * s.size;
+    st.h = s.rect.size.height > 0.f ? s.rect.size.height : 30.f * s.size;
+    st.grounded = s.onGround;
+    st.upside = s.upsideDown;
+    st.mini = s.mini;
+    st.hold = hold;
+    st.mode = s.mode;
+    return st;
+}
+
+SimWorld Pathfinder::simWorld(uint8_t ch, SimState const& st, float range) const {
+    SimWorld w;
+    std::vector<WorldObject const*> objs;
+    queryWindow(st.x - st.w - 10.f, st.x + range, objs);
+    w.objs.reserve(objs.size());
+    for (auto o : objs) {
+        SimObj so;
+        so.r = o->obj->getObjectRect();
+        so.kind = o->kind;
+        so.slope = o->obj->m_objectType == GameObjectType::Slope;
+        w.objs.push_back(so);
+    }
+    std::sort(w.objs.begin(), w.objs.end(), [](SimObj const& a, SimObj const& b) { return a.r.getMinX() < b.r.getMinX(); });
+    if (isBoundedMode(st.mode) && ch <= 1) {
+        float floorY = m_modeFloor[ch];
+        float ceilY = m_modeCeil[ch];
+        int b = bucketOf(st.x);
+        for (int d = -1; d <= 2; d++) {
+            auto f = m_learnedFloor[ch].find(b + d);
+            if (f != m_learnedFloor[ch].end()) floorY = std::max(floorY, f->second);
+            auto k = m_learnedCeil[ch].find(b + d);
+            if (k != m_learnedCeil[ch].end()) ceilY = std::min(ceilY, k->second);
+        }
+        // Stale guesses that don't contain the player are useless.
+        if (st.y - st.h * 0.5f < floorY - 2.f) floorY = 90.f;
+        if (st.y + st.h * 0.5f > ceilY + 2.f) ceilY = 1e9f;
+        w.floorY = floorY;
+        w.ceilY = ceilY;
+    } else {
+        w.floorY = 90.f;
+        w.ceilY = 1e9f;
+    }
+    return w;
+}
+
+std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick) {
+    (void)pl;
+    int floorT = m_human.minStateTicks(spotFailures(tick));
+    auto& plan = m_brainPlan[ch];
+    if (m_hold[ch]) {
+        int len = std::max(floorT, m_assistHold[ch]);
+        if (tick - m_lastToggle[ch] >= static_cast<uint64_t>(len)) {
+            m_assistHold[ch] = 0;
+            return false;
+        }
+        return std::nullopt;
+    }
+    // Cube, robot, ball and spider act from the ground only.
+    if (!s.onGround || s.vx <= 0.3f) {
+        plan = {};
+        return std::nullopt;
+    }
+
+    auto fire = [&]() -> std::optional<bool> {
+        m_assistHold[ch] = std::max(floorT, plan.len);
+        plan = {};
+        return true;
+    };
+
+    // A recent plan is still good: click when its moment comes.
+    if (plan.target >= 0 && static_cast<int64_t>(tick) <= plan.hi && tick - plan.madeAt < 8) {
+        if (static_cast<int64_t>(tick) >= plan.target) return fire();
+        return std::nullopt;
+    }
+    plan = {};
+
+    SimState st = toSim(s, false);
+    SimWorld w = simWorld(ch, st, st.vx * 140.f + 80.f);
+    InputFn none = [](int) { return false; };
+    auto rNone = Simulator::run(m_model, st, w, none, 120);
+    if (!rNone.died) return std::nullopt; // doing nothing is safe: do nothing
+
+    int since = static_cast<int>(tick - m_lastToggle[ch]);
+    int64_t earliest = std::max(0, floorT - since);
+    int cd = m_human.pressCooldown();
+    if (cd > 0) earliest = std::max<int64_t>(earliest, m_lastPress[ch] + cd - static_cast<int64_t>(tick));
+    int K = std::min(rNone.ticks - 1, 90);
+    if (earliest > K) return std::nullopt;
+
+    int tap = std::max(floorT, Humanizer::tapLength(m_human.params(), tick * 13 + ch));
+    if (m_human.params().profile == Profile::Unreal) tap = std::max(1, floorT);
+    std::vector<int> lens = {tap};
+    if (s.mode == Mode::Robot) lens = {tap, 24, 36, 50};
+    else if (s.mode == Mode::Cube) lens.push_back(std::max(floorT, 40));
+
+    for (int len : lens) {
+        auto survives = [&](int k) {
+            InputFn fn = [k, len](int i) { return i >= k && i < k + len; };
+            return !Simulator::run(m_model, st, w, fn, k + 110).died;
+        };
+        int first = -1;
+        for (int k = static_cast<int>(earliest); k <= K; k += 2) {
+            if (survives(k)) { first = k; break; }
+        }
+        if (first < 0) continue;
+        int lo = first;
+        while (lo - 1 >= earliest && survives(lo - 1)) lo--;
+        int hi = first;
+        while (hi + 1 <= K && hi - lo < 60 && survives(hi + 1)) hi++;
+        plan.lo = static_cast<int64_t>(tick) + lo;
+        plan.hi = static_cast<int64_t>(tick) + hi;
+        plan.len = len;
+        plan.madeAt = tick;
+        // Click where this profile likes to inside the window that works.
+        auto spot = Humanizer::humanSpot(m_human.params(), static_cast<uint64_t>(plan.lo), static_cast<uint64_t>(plan.hi),
+                                         static_cast<uint64_t>(plan.hi) * 7 + ch * 3);
+        if (spot > static_cast<uint64_t>(plan.hi)) spot = static_cast<uint64_t>(plan.lo + (plan.hi - plan.lo) / 2);
+        plan.target = static_cast<int64_t>(spot);
+        break;
+    }
+    if (plan.target < 0) return std::nullopt; // no click helps: let the search learn from it
+    if (static_cast<int64_t>(tick) >= plan.target) return fire();
+    return std::nullopt;
+}
+
+std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick,
+                                         std::optional<bool> want) {
+    (void)pl;
+    if (!brainOn() || s.vx <= 0.3f) return want;
+    if (m_pendingToggleAt[ch] >= 0 || m_tapReleaseAt[ch] >= 0) return want;
+    if (!want && tick - m_lastGuardTick[ch] < 2) return want;
+    m_lastGuardTick[ch] = tick;
+
+    bool tapMode = s.mode == Mode::Ufo || s.mode == Mode::Swing;
+    int fails = spotFailures(tick);
+    int floorT = m_human.minStateTicks(fails);
+    int tapLen = std::max(floorT, Humanizer::tapLength(m_human.params(), tick * 7 + ch));
+    bool cur = m_hold[ch];
+    SimState st = toSim(s, cur);
+    SimWorld w = simWorld(ch, st, st.vx * 50.f + 60.f);
+    constexpr int H = 36;
+
+    auto fnFor = [&](bool toggleNow) -> InputFn {
+        if (tapMode) {
+            if (toggleNow) return [tapLen](int i) { return i < tapLen; };
+            return [](int) { return false; };
+        }
+        bool v = toggleNow ? !cur : cur;
+        return [v](int) { return v; };
+    };
+    bool aToggles = tapMode ? (want.has_value() && *want) : (want.has_value() && *want != cur);
+    auto ra = Simulator::run(m_model, st, w, fnFor(aToggles), H);
+    if (!ra.died) return want; // the controller's choice looks safe
+    auto rb = Simulator::run(m_model, st, w, fnFor(!aToggles), H);
+    if (rb.died && rb.ticks <= ra.ticks + 6) return want; // switching doesn't help either
+
+    if (!aToggles) {
+        // The brain says: toggle now.
+        uint64_t sinceT = tick - m_lastToggle[ch];
+        bool floorOk = sinceT >= static_cast<uint64_t>(floorT) ||
+                       (m_human.microAllowed(fails) && sinceT >= static_cast<uint64_t>(m_human.microTicks()));
+        if (!floorOk) return want;
+        bool pressing = tapMode || !cur;
+        int cd = m_human.pressCooldown();
+        if (pressing && cd > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cd) return want;
+        if (tapMode) {
+            m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + tapLen;
+            return true;
+        }
+        return !cur;
+    }
+    // The brain says: don't do the toggle the controller wanted.
+    return std::nullopt;
+}
+
+void Pathfinder::rankWithBrain(Segment& s, Cluster& c) {
+    (void)s;
+    if (!brainOn()) return;
+    uint64_t ws = c.windowStart;
+    auto t0 = c.trace.at(c.ch, ws);
+    auto t1 = c.trace.at(c.ch, ws + 1);
+    if (!t0 || !t1 || ws == 0) return;
+    SimState st;
+    st.x = t0->x;
+    st.y = t0->y;
+    st.vy = t0->vy;
+    st.vx = t1->x - t0->x;
+    st.w = t0->w;
+    st.h = t0->h;
+    st.grounded = t0->onGround;
+    st.upside = t0->upsideDown;
+    st.mini = t0->mini;
+    st.mode = t0->mode;
+    if (st.vx <= 0.3f) return;
+    st.hold = stateFrom(c.attemptPlan, c.ch, ws - 1, false);
+
+    uint64_t d = c.deathTick;
+    int H = static_cast<int>(std::min<uint64_t>(d + 24 - ws, 360));
+    SimWorld w = simWorld(c.ch, st, st.vx * static_cast<float>(H) + 60.f);
+
+    auto holdsFor = [&](std::vector<Event> const& ev) {
+        std::vector<uint8_t> holds(static_cast<size_t>(H), 0);
+        bool h = st.hold;
+        size_t j = 0;
+        while (j < ev.size() && ev[j].tick < ws) { if (ev[j].ch == c.ch) h = ev[j].hold; j++; }
+        for (int i = 0; i < H; i++) {
+            uint64_t t = ws + static_cast<uint64_t>(i);
+            while (j < ev.size() && ev[j].tick <= t) { if (ev[j].ch == c.ch) h = ev[j].hold; j++; }
+            holds[static_cast<size_t>(i)] = h ? 1 : 0;
+        }
+        return holds;
+    };
+    auto simulate = [&](std::vector<Event> const& ev) {
+        auto holds = holdsFor(ev);
+        InputFn fn = [&holds](int i) { return holds[static_cast<size_t>(std::min<int>(i, static_cast<int>(holds.size()) - 1))] != 0; };
+        return Simulator::run(m_model, st, w, fn, H);
+    };
+
+    // Only trust the brain here if it can reproduce the death that happened.
+    auto replay = simulate(c.attemptPlan);
+    uint64_t simDeath = ws + static_cast<uint64_t>(replay.ticks);
+    bool agree = replay.died && absDiff(static_cast<int64_t>(simDeath), static_cast<int64_t>(d)) <= 12;
+    m_model.noteAccuracy(agree);
+    if (!agree) return;
+
+    std::vector<Event> baseCh;
+    for (auto const& e : c.base) if (e.ch == c.ch) baseCh.push_back(e);
+    for (size_t i = c.next; i < c.queue.size(); i++) {
+        auto& cand = c.queue[i];
+        if (cand.live) continue;
+        std::vector<Event> ev = baseCh;
+        ev.insert(ev.end(), cand.events.begin(), cand.events.end());
+        sortEvents(ev);
+        auto r = simulate(ev);
+        uint64_t at = ws + static_cast<uint64_t>(r.ticks);
+        if (!r.died || at > d + 6) cand.score -= r.uncertain ? 2500.0 : 5000.0; // predicted to get past
+        else if (at > d) cand.score -= static_cast<double>(std::min<uint64_t>(400, (at - d) * 20));
+    }
+    std::stable_sort(c.queue.begin() + static_cast<std::ptrdiff_t>(c.next), c.queue.end(),
+                     [](Candidate const& a, Candidate const& b) { return a.score < b.score; });
+}
+
 // ---------------------------------------------------------------------------
 // HUD
 // ---------------------------------------------------------------------------
@@ -1822,6 +2119,9 @@ std::string Pathfinder::hudText(PlayLayer* pl) const {
     std::string status = m_status;
     if (m_fastForward) status += status.empty() ? ">> fast-forward" : "  >>";
     if (m_fastRespawnBroken) status += " (instant respawn off)";
+    if (brainOn() && m_model.accuracySamples() > 0) {
+        status += fmt::format("{}Brain {:.0f}%", status.empty() ? "" : " | ", m_model.accuracy() * 100.f);
+    }
     if (!status.empty()) line += "\n" + status;
     return line;
 }
