@@ -18,21 +18,29 @@ Every push to `main` builds on GitHub Actions. Grab `lockyexe.practice-pathfinde
 
 Your own clicks are ignored while it's on (setting), so they don't end up in the macro.
 
-## Modes (F7 cycles 1 -> 2 -> 3)
+## Modes (F7 / M button cycles 1 -> 2 -> 3 -> 4)
 
-| | 1-Human | 2-Prodigy 15CPS | 3-Unreal ILL 15CPS |
-| --- | --- | --- | --- |
-| Min hold / release | 12-16 ticks (2-4 after >15 fails) | 6-8 ticks, never micro | 1-tick swift releases allowed |
-| Click cap | none | >= 16 ticks between presses (15 CPS) | >= 16 ticks between presses (15 CPS) |
-| Ship/wave band | ±10-16 + drift | ±2.5-5 + damped curve | ±0.8-1.5, no drift |
-| Timing bias | 45-65% of window | 35-55% ±1 tick | none (chronological) |
-| Jitter | 0-3 ticks | 0-1 tick | none |
-| Auto checkpoint | 192-288 ticks | 150-210 ticks | 85-130 ticks |
-| Backtrack after | 35 fails (setting) | 65 fails | 120 fails |
-| Extra | | | >10 crashes within ±5 units → exact -8..+8 tick sweep (swift + sustained) |
+| | 1-Human | 2-Prodigy 15CPS | 3-Unreal ILL 15CPS | 4-Unnerfed 100CPS |
+| --- | --- | --- | --- | --- |
+| Min hold / release | 12-16 ticks (2-4 after >15 fails) | 6-8 ticks, never micro | 1-tick swift releases allowed | 1 tick |
+| Click cap | none | >= 16 ticks between presses (15 CPS) | >= 16 ticks between presses (15 CPS) | rolling 100 per second, only spams in tight spots |
+| Ship/wave band | ±10-16 + drift | ±2.5-5 + damped curve | ±0.8-1.5, no drift | 30% of the gap (relaxed when wide, razor-tight when narrow) |
+| Timing bias | 45-65% of window | 35-55% ±1 tick | none (chronological) | none (safest middle) |
+| Jitter | 0-3 ticks | 0-1 tick | none | none |
+| Auto checkpoint | 192-288 ticks | 150-210 ticks | 85-130 ticks | 85-130 ticks |
+| Backtrack after | 35 fails (setting) | 65 fails | 120 fails | 150 fails |
+| Extra | | | >10 crashes within ±5 units → exact -8..+8 tick sweep (swift + sustained) | exact frame sweep, plays as well as it can |
 
 All timings are physics ticks (240/s of game time), so it behaves the same at 1.0x or any speedhack.
 F6/F7 are read by virtual-key code, so they work on Turkish Q/F and any other layout.
+
+## Visuals (each can be turned off in settings)
+
+- **Status label** (top right), **PF / M buttons** (left), **path line** with green press / red release dots and a
+  green bar showing how much room the next click has, and a **frame-window counter** (top left) estimating how many
+  clicks had 11+, 9-10, 7-8, 5-6, 4, 3, 2 and 1-tick windows at 240 FPS.
+
+Note: Geode's policy doesn't allow AI-written mods on the official Geode index; this mod is for personal use.
 
 ## Brain (v1.3)
 

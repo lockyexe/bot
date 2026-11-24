@@ -27,6 +27,7 @@ char const* profileLabel(Profile p) {
         case Profile::Human: return "1-Human";
         case Profile::Prodigy: return "2-Prodigy 15CPS";
         case Profile::Unreal: return "3-Unreal ILL 15CPS";
+        case Profile::Unnerfed: return "4-Unnerfed 100CPS";
     }
     return "?";
 }
@@ -35,19 +36,23 @@ Profile nextProfile(Profile p) {
     switch (p) {
         case Profile::Human: return Profile::Prodigy;
         case Profile::Prodigy: return Profile::Unreal;
-        case Profile::Unreal: return Profile::Human;
+        case Profile::Unreal: return Profile::Unnerfed;
+        case Profile::Unnerfed: return Profile::Human;
     }
     return Profile::Human;
 }
 
 ProfileSpec const& profileSpec(Profile p) {
     // floor      micro     band          clamp drift       window       ctr  jit damp  cd  checkpoints  fails sweep
-    static ProfileSpec const human{12, 16, 2, 4, 10.f, 16.f, 4.f, 6.f, 12.f, 0.45, 0.65, true, 3, 1.f, 0, 192, 288, 0, false};
-    static ProfileSpec const prodigy{6, 8, 6, 8, 2.5f, 5.f, 1.5f, 2.f, 4.f, 0.35, 0.55, true, 1, 0.35f, 16, 150, 210, 65, false};
-    static ProfileSpec const unreal{1, 1, 1, 1, 0.8f, 1.5f, 0.5f, 0.f, 0.f, 0.0, 1.0, false, 0, 1.f, 16, 85, 130, 120, true};
+    //                               floor   micro  band          clamp drift      window       ctr   jit damp  cd  checkpoints fails sweep  cps  adaptive
+    static ProfileSpec const human{12, 16, 2, 4, 10.f, 16.f, 4.f, 6.f, 12.f, 0.45, 0.65, true, 3, 1.f, 0, 192, 288, 0, false, 0, false};
+    static ProfileSpec const prodigy{6, 8, 6, 8, 2.5f, 5.f, 1.5f, 2.f, 4.f, 0.35, 0.55, true, 1, 0.35f, 16, 150, 210, 65, false, 15, false};
+    static ProfileSpec const unreal{1, 1, 1, 1, 0.8f, 1.5f, 0.5f, 0.f, 0.f, 0.0, 1.0, false, 0, 1.f, 16, 85, 130, 120, true, 15, false};
+    static ProfileSpec const unnerfed{1, 1, 1, 1, 0.5f, 1.0f, 0.3f, 0.f, 0.f, 0.0, 1.0, false, 0, 1.f, 2, 85, 130, 150, true, 100, true};
     switch (p) {
         case Profile::Prodigy: return prodigy;
         case Profile::Unreal: return unreal;
+        case Profile::Unnerfed: return unnerfed;
         default: return human;
     }
 }
@@ -66,6 +71,7 @@ int Humanizer::tapLength(HumanParams const& p, uint64_t key) {
             return p.baseFloor + static_cast<int>(k * static_cast<float>(hi - p.baseFloor + 1) * 0.999f);
         }
         case Profile::Unreal: return 1;
+        case Profile::Unnerfed: return 1;
     }
     return p.baseFloor;
 }
@@ -104,6 +110,7 @@ bool Humanizer::microAllowed(int spotFailures) const {
         case Profile::Human: return spotFailures > 15;
         case Profile::Prodigy: return false; // crisp, never 1-frame jitter
         case Profile::Unreal: return true;   // 1-tick swift releases always allowed
+        case Profile::Unnerfed: return true;
     }
     return false;
 }
@@ -138,8 +145,14 @@ float Humanizer::drift(uint64_t tick, float corridorHeight) const {
 }
 
 float Humanizer::band(float corridorHeight, float scale) const {
-    float b = m_params.band * scale;
     float lo = spec().bandClamp;
+    if (spec().adaptiveBand) {
+        // Mode 4: relaxed in wide corridors (few clicks), razor-tight in
+        // narrow ones (spam only where it's needed).
+        float maxB = std::max(lo, corridorHeight * 0.5f - 2.f);
+        return std::clamp(corridorHeight * 0.3f * scale, lo, maxB);
+    }
+    float b = m_params.band * scale;
     // Keep the band inside the corridor, but never collapse below the profile's floor.
     float maxB = std::max(lo, corridorHeight * 0.5f - 6.f);
     return std::clamp(b, lo, maxB);

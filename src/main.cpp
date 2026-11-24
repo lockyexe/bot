@@ -72,6 +72,13 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
         std::string lastText;
         ButtonSprite* toggleSpr = nullptr;
         ButtonSprite* modeSpr = nullptr;
+        CCLabelBMFont* windowsLabel = nullptr;
+        std::string lastWindowsText;
+        CCDrawNode* pathNode = nullptr;
+        CCDrawNode* roomNode = nullptr;
+        size_t drawnPts = 0;
+        size_t drawnMarks = 0;
+        uint64_t drawnAttempt = UINT64_MAX;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -90,8 +97,62 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
         this->addChild(label, 1000);
         m_fields->hud = label;
         if (Mod::get()->getSettingValue<bool>("touch-buttons")) addTouchButtons();
+
+        // Frame-window counter (top-left).
+        auto wl = CCLabelBMFont::create("", "chatFont.fnt");
+        wl->setAnchorPoint({0.f, 1.f});
+        wl->setScale(0.45f);
+        wl->setOpacity(200);
+        wl->setPosition({6.f, win.height - 6.f});
+        wl->setID("pathfinder-frame-windows"_spr);
+        this->addChild(wl, 1000);
+        m_fields->windowsLabel = wl;
+
         updateHud();
         return true;
+    }
+
+    // Path line, click/release points and the "room" bar for the next click.
+    void updateVisuals() {
+        auto& f = *m_fields.self();
+        bool showPath = Mod::get()->getSettingValue<bool>("show-path");
+        if (!showPath || !m_objectLayer) {
+            if (f.pathNode) f.pathNode->setVisible(false);
+            if (f.roomNode) f.roomNode->setVisible(false);
+            return;
+        }
+        if (!f.pathNode) {
+            f.pathNode = CCDrawNode::create();
+            f.pathNode->setID("pathfinder-path"_spr);
+            m_objectLayer->addChild(f.pathNode, 9999);
+            f.roomNode = CCDrawNode::create();
+            f.roomNode->setID("pathfinder-room"_spr);
+            m_objectLayer->addChild(f.roomNode, 9999);
+        }
+        f.pathNode->setVisible(true);
+        f.roomNode->setVisible(true);
+        auto const& pts = solver().pathPoints();
+        auto const& marks = solver().clickMarks();
+        if (f.drawnAttempt != solver().attemptId() || pts.size() < f.drawnPts || marks.size() < f.drawnMarks) {
+            f.pathNode->clear();
+            f.drawnPts = 0;
+            f.drawnMarks = 0;
+            f.drawnAttempt = solver().attemptId();
+        }
+        ccColor4F line{1.f, 1.f, 0.45f, 0.75f};
+        for (size_t i = std::max<size_t>(f.drawnPts, 1); i < pts.size(); i++) {
+            f.pathNode->drawSegment(pts[i - 1], pts[i], 0.8f, line);
+        }
+        f.drawnPts = pts.size();
+        for (size_t i = f.drawnMarks; i < marks.size(); i++) {
+            ccColor4F c = marks[i].second ? ccColor4F{0.3f, 1.f, 0.4f, 1.f} : ccColor4F{1.f, 0.35f, 0.35f, 1.f};
+            f.pathNode->drawDot(marks[i].first, 2.6f, c);
+        }
+        f.drawnMarks = marks.size();
+        f.roomNode->clear();
+        if (solver().roomValid()) {
+            f.roomNode->drawSegment(solver().roomFrom(), solver().roomTo(), 2.5f, ccColor4F{0.3f, 1.f, 0.45f, 0.45f});
+        }
     }
 
     // On-screen buttons for phones/tablets (and anyone who'd rather tap):
@@ -158,6 +219,18 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
         PlayLayer::postUpdate(dt);
         solver().onPostUpdate(this);
         updateHud();
+        updateVisuals();
+        if (auto wl = m_fields->windowsLabel) {
+            bool show = Mod::get()->getSettingValue<bool>("show-frame-windows");
+            wl->setVisible(show);
+            if (show) {
+                auto text = solver().frameWindowsText();
+                if (text != m_fields->lastWindowsText) {
+                    m_fields->lastWindowsText = text;
+                    wl->setString(text.c_str());
+                }
+            }
+        }
     }
 
     void resetLevel() {

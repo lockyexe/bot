@@ -231,6 +231,15 @@ public:
     bool active(PlayLayer* pl) const;
     std::string hudText(PlayLayer* pl) const;
 
+    // Visuals (drawn by the PlayLayer hook, each can be turned off)
+    uint64_t attemptId() const { return m_attemptId; }
+    std::vector<cocos2d::CCPoint> const& pathPoints() const { return m_pathPts; }
+    std::vector<std::pair<cocos2d::CCPoint, bool>> const& clickMarks() const { return m_marks; }
+    bool roomValid() const { return m_roomValid; }
+    cocos2d::CCPoint roomFrom() const { return m_roomFrom; }
+    cocos2d::CCPoint roomTo() const { return m_roomTo; }
+    std::string frameWindowsText() const;
+
 private:
     // World
     void buildIndex(PlayLayer* pl);
@@ -290,6 +299,13 @@ private:
                    bool check) const;
     void startPolish(Segment& s);
     bool resolvePolish(Segment& s, uint64_t deathTick); // true: the death was the polish's fault
+
+    // Click caps (15 CPS cooldown, Mode 4 rolling 100 CPS)
+    int pressWait(uint8_t ch, uint64_t tick) const;
+    bool exactProfile() const;
+    // Frame windows: how much room each click had, estimated with the brain
+    void measureWindows(Segment const& sg, Trace const& trace, uint64_t endTick);
+    void setRoom(PlayerSnap const& s, uint64_t tick, int64_t lo, int64_t hi);
 
     // Brain (learned physics + lookahead)
     bool brainOn() const;
@@ -384,6 +400,16 @@ private:
     float m_p2PrevX = 0, m_p2PrevY = 0;
     bool m_p2Prev = false;
     uint64_t m_lastGuardTick[2] = {0, 0};
+
+    // Visuals + stats
+    uint64_t m_attemptId = 0;
+    std::vector<cocos2d::CCPoint> m_pathPts;
+    std::vector<std::pair<cocos2d::CCPoint, bool>> m_marks;
+    bool m_roomValid = false;
+    cocos2d::CCPoint m_roomFrom, m_roomTo;
+    int m_windowCounts[8] = {}; // 1, 2, 3, 4, 5-6, 7-8, 9-10, 11+ ticks
+    int m_windowMeasured = 0;
+    std::vector<int64_t> m_pressWindow[2]; // recent presses for the rolling CPS cap
 
     std::string m_status;
     int m_totalDeaths = 0;

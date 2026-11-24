@@ -10,6 +10,9 @@
 //   Mode 3 - Unreal ILL 15CPS 1-tick releases allowed, ±0.8-1.5 band,
 //                             no jitter / no centering, exact frame
 //                             sweeps on stuck obstacles, 15 CPS cap
+//   Mode 4 - Unnerfed 100CPS  plays as well as it can: 1-tick inputs, up to
+//                             100 clicks per second, but only spams where
+//                             the gap is tight (relaxed in wide corridors)
 //
 // Every duration here is in physics ticks (240 per second of game time),
 // never wall-clock time, so the bot plays the same at 1.0x or with any
@@ -22,10 +25,11 @@
 
 namespace pf {
 
-enum class Profile : int { Human = 1, Prodigy = 2, Unreal = 3 };
+enum class Profile : int { Human = 1, Prodigy = 2, Unreal = 3, Unnerfed = 4 };
+constexpr int PROFILE_COUNT = 4;
 
 char const* profileLabel(Profile p); // "1-Human", "2-Prodigy 15CPS", ...
-Profile nextProfile(Profile p);      // 1 -> 2 -> 3 -> 1
+Profile nextProfile(Profile p);      // 1 -> 2 -> 3 -> 4 -> 1
 
 // Fixed per-profile tuning (the ranges a segment's personality is drawn from).
 struct ProfileSpec {
@@ -42,6 +46,8 @@ struct ProfileSpec {
     uint64_t cpMin, cpMax;          // auto-checkpoint interval, ticks
     int maxFailures;                // 0 = use the setting
     bool frameSweep;                // exact -8..+8 tick sweep on stuck spots
+    int cpsCap;                     // rolling clicks-per-second cap (0 = none)
+    bool adaptiveBand;              // band follows the corridor: relaxed when wide, tight when narrow
 };
 
 ProfileSpec const& profileSpec(Profile p);
@@ -75,6 +81,7 @@ public:
     int microTicks() const { return m_params.microFloor; }
     bool microAllowed(int spotFailures) const;
     int pressCooldown() const { return spec().pressCooldown; }
+    int cpsCap() const { return spec().cpsCap; }
 
     float drift(uint64_t tick, float corridorHeight) const;
     float band(float corridorHeight, float scale) const;

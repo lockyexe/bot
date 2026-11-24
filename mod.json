@@ -6,7 +6,7 @@
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.6.1",
+	"version": "v1.7.0",
 	"developer": "lockyexe",
 	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases (PC and Android)",
 	"tags": [
@@ -17,7 +17,7 @@
 		"enabled": {
 			"type": "bool",
 			"name": "Start enabled",
-			"description": "Turn the solver on as soon as you enter a level. Toggle it mid-run with <cy>F6</c> (PC) or the <cy>PF</c> button, switch Mode 1 / 2 / 3 with <cy>F7</c> or the <cy>M</c> button. Keys work on any keyboard layout (Turkish too). It only plays while you are in <cg>Practice Mode</c>.",
+			"description": "Turn the solver on as soon as you enter a level. Toggle it mid-run with <cy>F6</c> (PC) or the <cy>PF</c> button, switch Mode 1 / 2 / 3 / 4 with <cy>F7</c> or the <cy>M</c> button. Keys work on any keyboard layout (Turkish too). It only plays while you are in <cg>Practice Mode</c>.",
 			"default": false
 		},
 		"auto-checkpoints": {
@@ -97,13 +97,25 @@
 		"touch-buttons": {
 			"type": "bool",
 			"name": "On-screen buttons",
-			"description": "Show two small buttons on the left side of the level: <cy>PF</c> turns the solver on/off and <cy>M1/M2/M3</c> switches the mode. Needed on phones and tablets; on PC you can also use F6/F7.",
+			"description": "Show two small buttons on the left side of the level: <cy>PF</c> turns the solver on/off and <cy>M1-M4</c> switches the mode. Needed on phones and tablets; on PC you can also use F6/F7.",
 			"default": true
 		},
 		"exact-inputs": {
 			"type": "bool",
 			"name": "Exact inputs",
 			"description": "Apply every click on the exact tick it was planned. This game version normally delays clicks by a varying number of ticks (depending on FPS and speed), which makes retries inconsistent. Your recorder still captures every click. Only turn off if something acts weird.",
+			"default": true
+		},
+		"show-path": {
+			"type": "bool",
+			"name": "Show path line",
+			"description": "Draw the player's path, green dots where it pressed, red where it released, and a green bar showing how much room the next click has.",
+			"default": true
+		},
+		"show-frame-windows": {
+			"type": "bool",
+			"name": "Show frame-window counter",
+			"description": "Top-left panel counting how many clicks had 11+, 9-10, 7-8, 5-6, 4, 3, 2 and 1-tick windows (at 240 FPS), estimated with the brain's physics for each finished checkpoint.",
 			"default": true
 		}
 	}

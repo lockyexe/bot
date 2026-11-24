@@ -241,7 +241,7 @@ void Pathfinder::onLevelInit(PlayLayer* pl) {
     m_enabled = settingBool("enabled");
     {
         auto saved = Mod::get()->getSavedValue<int64_t>("profile", 1);
-        m_profile = static_cast<Profile>(std::clamp<int64_t>(saved, 1, 3));
+        m_profile = static_cast<Profile>(std::clamp<int64_t>(saved, 1, PROFILE_COUNT));
     }
     m_segments.clear();
     m_doomed.clear();
@@ -264,6 +264,11 @@ void Pathfinder::onLevelInit(PlayLayer* pl) {
         m_modeKnown[c] = false;
     }
     m_brainPlan[0] = m_brainPlan[1] = {};
+    for (auto& c : m_windowCounts) c = 0;
+    m_windowMeasured = 0;
+    m_pathPts.clear();
+    m_marks.clear();
+    m_roomValid = false;
     if (!m_modelLoaded) {
         m_modelLoaded = true;
         m_model.deserialize(Mod::get()->getSavedValue<std::string>("brain-model", ""));
@@ -324,6 +329,7 @@ void Pathfinder::syncSegments(PlayLayer* pl) {
 void Pathfinder::onCheckpointAdded(PlayLayer* pl, uint64_t tick, bool ours) {
     if (m_segments.empty()) syncSegments(pl);
     auto& parent = seg();
+    measureWindows(parent, m_trace, tick);
     parent.lastTrace = m_trace;
     // A polish still being tested in the parent stays as it is: the run got
     // past it, so it works.
@@ -386,6 +392,12 @@ void Pathfinder::onReset(PlayLayer* pl) {
     m_pred = {};
     m_pressHist.clear();
     m_p2Prev = false;
+    m_attemptId++;
+    m_pathPts.clear();
+    m_marks.clear();
+    m_roomValid = false;
+    m_pressWindow[0].clear();
+    m_pressWindow[1].clear();
     m_deathHandled = false;
     m_divergedThisAttempt = false;
     m_pendingCheckpoint = false;
@@ -730,7 +742,13 @@ void Pathfinder::press(PlayLayer* pl, uint8_t ch, bool down, uint64_t tick, bool
     }
     m_hold[ch] = down;
     m_lastToggle[ch] = tick;
-    if (down) m_lastPress[ch] = static_cast<int64_t>(tick);
+    if (down) {
+        m_lastPress[ch] = static_cast<int64_t>(tick);
+        auto& win = m_pressWindow[ch];
+        win.push_back(static_cast<int64_t>(tick));
+        if (win.size() > 256) win.erase(win.begin(), win.begin() + 128);
+    }
+    if (ch == 0 && pl->m_player1 && m_marks.size() < 20000) m_marks.push_back({pl->m_player1->m_position, down});
     if (ch == 0) {
         m_pred.valid = false; // the "safe" prediction assumed no new input
         if (down) {
@@ -843,9 +861,8 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
     }
     if (!want) return std::nullopt;
 
-    // 15 CPS hard cap (Modes 2/3): >= 16 ticks between two presses.
-    int cooldown = m_human.pressCooldown();
-    if (*want && cooldown > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cooldown) return std::nullopt;
+    // Click caps: 15 CPS (Modes 2/3), rolling 100 CPS (Mode 4).
+    if (*want && pressWait(ch, tick) > 0) return std::nullopt;
 
     uint64_t since = tick - m_lastToggle[ch];
     if (since < static_cast<uint64_t>(floorT)) {
@@ -886,8 +903,7 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     if (s.mode != Mode::Cube && s.mode != Mode::Robot) return std::nullopt;
     if (!s.onGround || s.vx <= 0.5f) return std::nullopt;
     if (tick - m_lastToggle[ch] < static_cast<uint64_t>(floorT)) return std::nullopt;
-    int cooldown = m_human.pressCooldown();
-    if (cooldown > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cooldown) return std::nullopt;
+    if (pressWait(ch, tick) > 0) return std::nullopt;
 
     float air = s.mode == Mode::Robot ? 70.f : (s.mini ? 72.f : 88.f);
     float span = s.vx * air;
@@ -913,7 +929,8 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     float frac = 0.08f + 0.26f * (0.45f + 0.20f * Humanizer::hash01(key)); // Mode 1: 45-65%
     switch (m_human.params().profile) {
         case Profile::Prodigy: frac = 0.08f + 0.26f * (0.35f + 0.20f * Humanizer::hash01(key)); break; // 35-55%
-        case Profile::Unreal: frac = 0.08f + 0.26f * 0.5f; break; // no centering bias, no variance
+        case Profile::Unreal:
+        case Profile::Unnerfed: frac = 0.08f + 0.26f * 0.5f; break; // no centering bias, no variance
         default: break;
     }
     if (best <= frac * span) {
@@ -1046,6 +1063,8 @@ void Pathfinder::onTick(PlayLayer* pl) {
         if (ch == 0) s0 = s;
     }
     if (!s0.valid) return;
+    if (m_pathPts.size() < 40000) m_pathPts.push_back({s0.x, s0.y});
+    if (m_roomValid && m_roomTo.x < s0.x - 5.f) m_roomValid = false;
     // Player 2 in regular (one-input) dual: keep its speed for the brain.
     if (pl->m_gameState.m_isDualMode && nch == 1 && pl->m_player2) {
         m_p2PrevX = pl->m_player2->m_position.x;
@@ -1283,7 +1302,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
     uint64_t ws = c.windowStart;
     uint64_t d = std::max(c.deathTick, ws + 2);
     int floorT = s.human.baseFloor;
-    bool unreal = s.human.profile == Profile::Unreal;
+    bool unreal = s.human.profile == Profile::Unreal || s.human.profile == Profile::Unnerfed; // exact timing
     bool holdAtWs = stateFrom(c.base, c.ch, ws, false);
     std::vector<Candidate> out;
     std::unordered_set<uint64_t> seen;
@@ -1487,7 +1506,7 @@ void Pathfinder::addPairs(Segment& s, Cluster& c, bool front) {
             if (t2 > c.deathTick + 10) continue;
             Candidate p = *first;
             int tap = std::max(floorT, Humanizer::tapLength(s.human, t2 * 17 + c.deathTick));
-            if (s.human.profile == Profile::Unreal) tap = 1;
+            if (s.human.profile == Profile::Unreal || s.human.profile == Profile::Unnerfed) tap = 1;
             p.events.push_back({t2, true, c.ch});
             p.events.push_back({t2 + static_cast<uint64_t>(tap), false, c.ch});
             sortEvents(p.events);
@@ -2074,6 +2093,7 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
         plan = {};
         return true;
     };
+    (void)fire;
 
     // A recent plan is still good: click when its moment comes.
     if (plan.target >= 0 && static_cast<int64_t>(tick) <= plan.hi && tick - plan.madeAt < 8) {
@@ -2097,13 +2117,12 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
 
     int since = static_cast<int>(tick - m_lastToggle[ch]);
     int64_t earliest = std::max(0, floorT - since);
-    int cd = m_human.pressCooldown();
-    if (cd > 0) earliest = std::max<int64_t>(earliest, m_lastPress[ch] + cd - static_cast<int64_t>(tick));
+    earliest = std::max<int64_t>(earliest, pressWait(ch, tick));
     int K = std::min(rNone.ticks - 1, 90);
     if (earliest > K) return std::nullopt;
 
     int tap = std::max(floorT, Humanizer::tapLength(m_human.params(), tick * 13 + ch));
-    if (m_human.params().profile == Profile::Unreal) tap = std::max(1, floorT);
+    if (exactProfile()) tap = std::max(1, floorT);
     std::vector<int> lens = {tap};
     if (s.mode == Mode::Robot) lens = {tap, 24, 36, 50};
     else if (s.mode == Mode::Cube) lens.push_back(std::max(floorT, 40));
@@ -2131,8 +2150,9 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
                                          static_cast<uint64_t>(plan.hi) * 7 + ch * 3);
         if (spot > static_cast<uint64_t>(plan.hi)) spot = static_cast<uint64_t>(plan.lo + (plan.hi - plan.lo) / 2);
         plan.target = static_cast<int64_t>(spot);
+        if (ch == 0) setRoom(s, tick, plan.lo, plan.hi);
         // Don't repeat the exact same click interval twice in a row.
-        if (ch == 0 && m_pressHist.size() >= 2 && m_human.params().profile != Profile::Unreal) {
+        if (ch == 0 && m_pressHist.size() >= 2 && !exactProfile()) {
             int64_t lastGap = m_pressHist.back() - m_pressHist[m_pressHist.size() - 2];
             if (plan.target - m_pressHist.back() == lastGap) {
                 if (plan.target + 1 <= plan.hi) plan.target++;
@@ -2196,11 +2216,8 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
     uint64_t sinceT = tick - m_lastToggle[ch];
     int earliest = sinceT >= static_cast<uint64_t>(floorT) ? 0 : static_cast<int>(floorT - sinceT);
     if (m_human.microAllowed(fails) && sinceT >= static_cast<uint64_t>(m_human.microTicks())) earliest = 0;
-    int cd = m_human.pressCooldown();
     bool switchPresses = tapMode || !cur;
-    if (switchPresses && cd > 0) {
-        earliest = std::max<int>(earliest, static_cast<int>(std::max<int64_t>(0, m_lastPress[ch] + cd - static_cast<int64_t>(tick))));
-    }
+    if (switchPresses) earliest = std::max(earliest, pressWait(ch, tick));
 
     std::vector<int> ok;
     int bestK = -1, bestTicks = ra.ticks;
@@ -2227,6 +2244,7 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
                                      (tick + static_cast<uint64_t>(hi)) * 5 + ch);
     if (spot > tick + static_cast<uint64_t>(hi)) spot = tick + static_cast<uint64_t>(lo + (hi - lo) / 2);
     int k = static_cast<int>(spot - tick);
+    if (ch == 0) setRoom(s, tick, static_cast<int64_t>(tick) + lo, static_cast<int64_t>(tick) + hi);
 
     bool to = tapMode ? true : !cur;
     if (k <= 0) {
@@ -2306,6 +2324,132 @@ void Pathfinder::rankWithBrain(Segment& s, Cluster& c) {
     }
     std::stable_sort(c.queue.begin() + static_cast<std::ptrdiff_t>(c.next), c.queue.end(),
                      [](Candidate const& a, Candidate const& b) { return a.score < b.score; });
+}
+
+
+// ---------------------------------------------------------------------------
+// click caps, room bar, frame windows
+// ---------------------------------------------------------------------------
+
+bool Pathfinder::exactProfile() const {
+    auto p = m_human.params().profile;
+    return p == Profile::Unreal || p == Profile::Unnerfed;
+}
+
+int Pathfinder::pressWait(uint8_t ch, uint64_t tick) const {
+    if (ch > 1) return 0;
+    int64_t now = static_cast<int64_t>(tick);
+    int64_t wait = 0;
+    int cd = m_human.pressCooldown();
+    if (cd > 0) wait = std::max<int64_t>(wait, m_lastPress[ch] + cd - now);
+    int cap = m_human.cpsCap();
+    if (cap > 0) {
+        // Rolling cap: at most `cap` presses in any 240-tick (1 s) span.
+        auto const& w = m_pressWindow[ch];
+        int recent = 0;
+        for (auto it = w.rbegin(); it != w.rend() && *it > now - 240; ++it) recent++;
+        if (recent >= cap && static_cast<int>(w.size()) >= cap) {
+            int64_t oldest = w[w.size() - static_cast<size_t>(cap)];
+            wait = std::max<int64_t>(wait, oldest + 240 - now);
+        }
+    }
+    return static_cast<int>(std::max<int64_t>(0, wait));
+}
+
+void Pathfinder::setRoom(PlayerSnap const& s, uint64_t tick, int64_t lo, int64_t hi) {
+    float vx = std::max(s.vx, 0.f);
+    m_roomFrom = {s.x + static_cast<float>(lo - static_cast<int64_t>(tick)) * vx, s.y};
+    m_roomTo = {s.x + static_cast<float>(hi - static_cast<int64_t>(tick)) * vx, s.y};
+    m_roomValid = true;
+}
+
+void Pathfinder::measureWindows(Segment const& sg, Trace const& trace, uint64_t endTick) {
+    // For every click of a finished stretch: shift it earlier/later one tick
+    // at a time in the brain's simulation and count how many ticks still
+    // survive. That's the click's frame window (at 240 FPS).
+    if (!brainOn() || !settingBool("show-frame-windows")) return;
+    std::vector<Event> ev;
+    for (auto const& e : sg.plan) if (e.ch == 0) ev.push_back(e);
+    sortEvents(ev);
+    for (size_t i = 0; i < ev.size(); i++) {
+        auto const& e = ev[i];
+        if (!e.hold || e.tick >= endTick || e.tick < trace.base + 25) continue;
+        uint64_t s0 = e.tick - 20;
+        auto t0 = trace.at(0, s0);
+        auto t1 = trace.at(0, s0 + 1);
+        if (!t0 || !t1 || !m_model.trusted(t0->mode)) continue;
+        // its release and the neighbouring events limit how far it can move
+        int64_t rel = -1;
+        for (size_t j = i + 1; j < ev.size(); j++) if (!ev[j].hold) { rel = static_cast<int64_t>(ev[j].tick); break; }
+        int64_t prevT = i > 0 ? static_cast<int64_t>(ev[i - 1].tick) : static_cast<int64_t>(s0);
+        int64_t nextT = INT64_MAX;
+        for (size_t j = i + 1; j < ev.size(); j++) if (ev[j].hold) { nextT = static_cast<int64_t>(ev[j].tick); break; }
+
+        SimState st;
+        st.x = t0->x;
+        st.y = t0->y;
+        st.vy = t0->vy;
+        st.vx = t1->x - t0->x;
+        st.w = t0->w;
+        st.h = t0->h;
+        st.grounded = t0->onGround;
+        st.upside = t0->upsideDown;
+        st.mini = t0->mini;
+        st.mode = t0->mode;
+        st.hold = stateFrom(ev, 0, s0 - 1, false);
+        if (st.vx <= 0.3f) continue;
+        int H = static_cast<int>(std::min<int64_t>((rel >= 0 ? rel : static_cast<int64_t>(e.tick) + 20) + 45 - static_cast<int64_t>(s0), 260));
+        SimWorld w = simWorld(0, st, st.vx * static_cast<float>(H) + 60.f);
+
+        auto survivesAt = [&](int off) -> int { // 1 survive, 0 die, -1 unknown
+            int64_t pt = static_cast<int64_t>(e.tick) + off;
+            int64_t rt = rel >= 0 ? rel + off : -1;
+            if (pt <= prevT || pt < static_cast<int64_t>(s0) + 1 || (nextT != INT64_MAX && rt >= nextT)) return 0;
+            std::vector<uint8_t> holds(static_cast<size_t>(H), 0);
+            for (int k = 0; k < H; k++) {
+                int64_t t = static_cast<int64_t>(s0) + k;
+                // state from the plan, with this click moved by `off`
+                bool v = st.hold;
+                for (size_t q = 0; q < ev.size(); q++) {
+                    int64_t et = static_cast<int64_t>(ev[q].tick);
+                    if (q == i) et = pt;
+                    else if (rel >= 0 && !ev[q].hold && et == rel) et = rt;
+                    if (et <= t && et >= static_cast<int64_t>(s0) - 1) v = ev[q].hold;
+                }
+                holds[static_cast<size_t>(k)] = v ? 1 : 0;
+            }
+            InputFn fn = [&holds](int k) { return holds[static_cast<size_t>(std::min<int>(k, static_cast<int>(holds.size()) - 1))] != 0; };
+            auto r = Simulator::run(m_model, st, w, fn, H);
+            if (r.uncertain && !r.died) return -1;
+            return r.died ? 0 : 1;
+        };
+        if (survivesAt(0) != 1) continue; // the brain can't reproduce this click: skip it
+        int left = 0, right = 0;
+        bool unknown = false;
+        for (int off = -1; off >= -20; off--) {
+            int r = survivesAt(off);
+            if (r < 0) { unknown = true; break; }
+            if (r == 0) break;
+            left++;
+        }
+        for (int off = 1; off <= 20 && !unknown; off++) {
+            int r = survivesAt(off);
+            if (r < 0) { unknown = true; break; }
+            if (r == 0) break;
+            right++;
+        }
+        if (unknown) continue;
+        int win = 1 + left + right;
+        int bucket = win <= 4 ? win - 1 : win <= 6 ? 4 : win <= 8 ? 5 : win <= 10 ? 6 : 7;
+        m_windowCounts[bucket]++;
+        m_windowMeasured++;
+    }
+}
+
+std::string Pathfinder::frameWindowsText() const {
+    return fmt::format("Frame windows (est.)\n11+: {}\n9-10: {}\n7-8: {}\n5-6: {}\n4: {}\n3: {}\n2: {}\n1: {}",
+                       m_windowCounts[7], m_windowCounts[6], m_windowCounts[5], m_windowCounts[4], m_windowCounts[3],
+                       m_windowCounts[2], m_windowCounts[1], m_windowCounts[0]);
 }
 
 // ---------------------------------------------------------------------------
