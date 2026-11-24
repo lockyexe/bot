@@ -6,7 +6,7 @@
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.7.0",
+	"version": "v1.7.1",
 	"developer": "lockyexe",
 	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases (PC and Android)",
 	"tags": [

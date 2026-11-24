@@ -396,6 +396,7 @@ private:
         bool valid = false;
     };
     Prediction m_pred;
+    Prediction m_planPred; // a jump the brain chose: it predicted survival
     std::vector<int64_t> m_pressHist; // recent press ticks (player 1), for the rhythm check
     float m_p2PrevX = 0, m_p2PrevY = 0;
     bool m_p2Prev = false;

@@ -390,6 +390,7 @@ void Pathfinder::onReset(PlayLayer* pl) {
         m_lastGuardTick[c] = 0;
     }
     m_pred = {};
+    m_planPred = {};
     m_pressHist.clear();
     m_p2Prev = false;
     m_attemptId++;
@@ -998,7 +999,7 @@ void Pathfinder::onTick(PlayLayer* pl) {
         if (!m_divergedThisAttempt && sg.cluster && !sg.activePolish && tick < sg.cluster->windowStart &&
             m_havePrevY[ch]) {
             if (auto ref = sg.cluster->trace.at(ch, tick)) {
-                if (std::abs(ref->x - s.x) > 2.f || std::abs(ref->y - s.y) > 3.f) m_divergedThisAttempt = true;
+                if (std::abs(ref->x - s.x) > 4.f || std::abs(ref->y - s.y) > 6.f) m_divergedThisAttempt = true;
             }
         }
 
@@ -1152,9 +1153,9 @@ bool Pathfinder::safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t 
     // Not right before something that needs a click.
     if (brainOn() && !isFlyMode(s.mode) && m_model.trusted(s.mode) && s.vx > 0.3f) {
         SimState st = toSim(s, false);
-        SimWorld w = simWorld(0, st, st.vx * 60.f + 60.f);
+        SimWorld w = simWorld(0, st, st.vx * 110.f + 60.f);
         InputFn none = [](int) { return false; };
-        if (Simulator::run(m_model, st, w, none, 45).died) return false;
+        if (Simulator::run(m_model, st, w, none, 100).died) return false;
     } // a checkpoint here already turned out to be a dead end
     if (pl->m_gameState.m_isDualMode && pl->m_player2) {
         uint8_t ch2 = channels(pl) == 2 ? 1 : 0;
@@ -1284,6 +1285,23 @@ void Pathfinder::openCluster(Segment& s, uint64_t deathTick, uint8_t ch, Mode mo
     c.attemptPlan = attemptPlan;
     uint64_t L = lookback(mode);
     c.windowStart = std::max(s.startTick, deathTick > L ? deathTick - L : 0);
+    // Cube/robot/ball/spider can only act from the ground (or an orb). After
+    // a long jump or fall the real decision - the takeoff - happened long
+    // before the death; make sure the window includes it, otherwise every
+    // try only changes useless mid-air clicks and repeats the same jump.
+    if (mode == Mode::Cube || mode == Mode::Robot || mode == Mode::Ball || mode == Mode::Spider) {
+        for (uint64_t t = deathTick; t > s.startTick && t + 400 > deathTick; t--) {
+            auto tt = trace.at(ch, t);
+            if (!tt) continue;
+            if (tt->onGround || tt->orbType >= 0) {
+                if (t + 6 < deathTick) {
+                    uint64_t lastAct = t > 30 ? t - 30 : 0;
+                    c.windowStart = std::max(s.startTick, std::min(c.windowStart, lastAct));
+                }
+                break;
+            }
+        }
+    }
     rebuildBase(s, c);
 
     // What just died is not worth trying again.
@@ -1373,6 +1391,61 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
                 auto order = Humanizer::orderWindow(s.human, runStart, t - 1, 1, runStart);
                 for (size_t i = 0; i < order.size(); i++) anchors.push_back({order[i], groupBase + group * 2 + i * 1.0});
                 group++;
+            }
+        }
+    }
+    // Edge jumps: where would the player walk off the platform it stands on
+    // at the window start? Try clicks in the last ticks before that edge.
+    if (c.mode == Mode::Cube || c.mode == Mode::Robot) {
+        auto t0 = c.trace.at(c.ch, ws);
+        auto t1 = c.trace.at(c.ch, ws + 1);
+        if (t0 && t1 && t0->onGround && t1->x > t0->x + 0.3f) {
+            float vx = t1->x - t0->x;
+            float half = t0->h * 0.5f;
+            bool upside = t0->upsideDown;
+            float foot = upside ? t0->y + half : t0->y - half;
+            std::vector<WorldObject const*> objs;
+            queryWindow(t0->x - t0->w, t0->x + 2000.f, objs);
+            // the block under the player, then every block continuing that floor
+            float edge = -1e9f;
+            float surface = 0.f;
+            auto isFloor = [&](cocos2d::CCRect const& r) {
+                float top = upside ? r.getMinY() : r.getMaxY();
+                return std::abs(top - foot) <= 3.f;
+            };
+            for (auto o : objs) {
+                if (o->kind != ObjKind::Solid) continue;
+                auto const& r = o->obj->getObjectRect();
+                if (!isFloor(r)) continue;
+                if (r.getMinX() <= t0->x + t0->w * 0.5f && r.getMaxX() >= t0->x - t0->w * 0.5f) {
+                    edge = std::max(edge, r.getMaxX());
+                    surface = upside ? r.getMinY() : r.getMaxY();
+                }
+            }
+            bool extended = edge > -1e8f;
+            while (extended) {
+                extended = false;
+                for (auto o : objs) {
+                    if (o->kind != ObjKind::Solid) continue;
+                    auto const& r = o->obj->getObjectRect();
+                    float top = upside ? r.getMinY() : r.getMaxY();
+                    if (std::abs(top - surface) > 1.f) continue;
+                    if (r.getMinX() <= edge + 1.f && r.getMaxX() > edge + 0.5f) {
+                        edge = r.getMaxX();
+                        extended = true;
+                    }
+                }
+            }
+            // the real ground (y = 90) has no edge
+            bool onRealGround = !upside && std::abs(foot - 90.f) <= 3.f;
+            if (edge > -1e8f && !onRealGround) {
+                float dist = edge - (t0->x - t0->w * 0.5f);
+                auto edgeTick = ws + static_cast<uint64_t>(std::max(0.f, dist / vx));
+                if (edgeTick > ws && edgeTick < d + 40) {
+                    uint64_t lo = edgeTick > ws + 24 ? edgeTick - 24 : ws;
+                    auto order = Humanizer::orderWindow(s.human, lo, edgeTick, 1, lo);
+                    for (size_t i = 0; i < order.size(); i++) anchors.push_back({order[i], groupBase + 12 + i * 1.0});
+                }
             }
         }
     }
@@ -1894,6 +1967,10 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
         m_model.noteMiss(m_pred.mode);
     }
     m_pred.valid = false;
+    if (m_planPred.valid && ch == 0 && tick >= m_planPred.at && tick <= m_planPred.until) {
+        m_model.noteMiss(m_planPred.mode);
+    }
+    m_planPred.valid = false;
 
     auto& s = seg();
 
@@ -1920,7 +1997,7 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     if (m_divergedThisAttempt && s.cluster && s.cluster->hasCurrent) {
         s.divergences++;
         if (s.divergences >= 3) s.noFastForward = true;
-        if (s.divergences <= 8) {
+        if (s.divergences <= 3) {
             s.failures--;
             applyCandidate(s, *s.cluster, s.cluster->current);
             m_status = "Replay drifted (random/moving part): retrying the same inputs";
@@ -2090,10 +2167,12 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
 
     auto fire = [&]() -> std::optional<bool> {
         m_assistHold[ch] = std::max(floorT, plan.len);
+        // Remember that the brain vouched for this jump: dying right after
+        // it means the brain was wrong here.
+        if (ch == 0) m_planPred = {tick, tick + static_cast<uint64_t>(plan.len) + 110, s.mode, true};
         plan = {};
         return true;
     };
-    (void)fire;
 
     // A recent plan is still good: click when its moment comes.
     if (plan.target >= 0 && static_cast<int64_t>(tick) <= plan.hi && tick - plan.madeAt < 8) {
@@ -2127,10 +2206,15 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
     if (s.mode == Mode::Robot) lens = {tap, 24, 36, 50};
     else if (s.mode == Mode::Cube) lens.push_back(std::max(floorT, 40));
 
+    // First look for clicks the brain is sure about; only if there are
+    // none, accept ones that run into something it can't simulate.
+    for (int pass = 0; pass < 2 && plan.target < 0; pass++)
     for (int len : lens) {
+        bool acceptUncertain = pass == 1;
         auto survives = [&](int k) {
             InputFn fn = [k, len](int i) { return i >= k && i < k + len; };
-            return !runAll(fn, k + 110).died;
+            auto r = runAll(fn, k + 110);
+            return !r.died && (acceptUncertain || !r.uncertain);
         };
         int first = -1;
         for (int k = static_cast<int>(earliest); k <= K; k += 2) {
