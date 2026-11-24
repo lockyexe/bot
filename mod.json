@@ -1,0 +1,71 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081"
+	},
+	"id": "lockyexe.macro-refiner",
+	"name": "Macro Refiner",
+	"version": "v1.0.0",
+	"developer": "lockyexe",
+	"description": "Cleans up a bot macro (spam clicks, noclip deaths, robotic timing) and verifies it beats the level at 100%",
+	"tags": [
+		"gameplay",
+		"utility"
+	],
+	"settings": {
+		"macro-file": {
+			"type": "file",
+			"name": "Macro file",
+			"description": "The macro to refine: <cy>.gdr</c> / <cy>.gdr.json</c> (xdBot) or <cy>.gdr2</c>. The result is saved next to it as <cg>realistic_output</c> with the same extension.",
+			"default": "",
+			"control": {
+				"dialog": "open",
+				"filters": [
+					{
+						"files": ["*.gdr", "*.json", "*.gdr2"],
+						"description": "GDR macros"
+					}
+				]
+			}
+		},
+		"ticks-per-frame": {
+			"type": "int",
+			"name": "Physics ticks per frame",
+			"description": "How many 240 TPS physics ticks the refiner runs per rendered frame. Higher = faster, but each frame takes longer.",
+			"default": 500,
+			"min": 20,
+			"max": 5000,
+			"control": {
+				"arrows": true,
+				"arrow-step": 50,
+				"slider": true,
+				"slider-step": 20
+			}
+		},
+		"max-ms-per-frame": {
+			"type": "int",
+			"name": "Max work per frame (ms)",
+			"description": "Stops a frame's work after this many milliseconds even if the tick budget isn't used up, so the game (and Android) never freezes.",
+			"default": 30,
+			"min": 5,
+			"max": 200,
+			"control": {
+				"arrows": true,
+				"slider": false
+			}
+		},
+		"snapshot-ring": {
+			"type": "int",
+			"name": "Snapshots kept",
+			"description": "How many snapshots (one every 20 ticks) are kept for rollbacks. 64 = about 5 seconds back.",
+			"default": 64,
+			"min": 16,
+			"max": 400,
+			"control": {
+				"arrows": true,
+				"slider": false
+			}
+		}
+	}
+}

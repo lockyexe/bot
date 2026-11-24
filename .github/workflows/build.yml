@@ -1,0 +1,64 @@
+name: Build Geode Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+        - name: Windows
+          os: windows-latest
+
+        - name: Android32
+          os: ubuntu-latest
+          target: Android32
+
+        - name: Android64
+          os: ubuntu-latest
+          target: Android64
+
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          combine: true
+          target: ${{ matrix.config.target }}
+          use-lto: false
+
+  package:
+    name: Package builds
+    runs-on: ubuntu-latest
+    needs: ['build']
+
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Macro Refiner
+          path: ${{ steps.build.outputs.build-output }}
+
+      - name: Publish the .geode as a release
+        if: github.ref == 'refs/heads/macro-refiner'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: macro-refiner-latest
+          name: Macro Refiner (latest build)
+          files: ${{ steps.build.outputs.build-output }}/*.geode
+          make_latest: false
+
+permissions:
+  contents: write
