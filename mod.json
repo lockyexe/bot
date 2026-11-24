@@ -3,14 +3,13 @@
 	"gd": {
 		"win": "2.2081",
 		"android": "2.2081",
-		"mac": "2.2081",
-		"ios": "2.2081"
+		"mac": "2.2081"
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
 	"version": "v1.6.0",
 	"developer": "lockyexe",
-	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases (PC, Android, iOS, Mac)",
+	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases (PC, Android, Mac)",
 	"tags": [
 		"gameplay",
 		"utility"
