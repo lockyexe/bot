@@ -11,7 +11,7 @@
 //   PlayLayer::destroyPlayer          deaths drive the search
 //   PlayLayer::resetLevel             every respawn starts a new attempt
 //   PlayLayer::postUpdate             auto-checkpoints + status label
-//   CCScheduler::update               F6 toggle
+//   CCScheduler::update               F6 on/off, F7 mode cycle (any keyboard layout)
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -118,25 +118,53 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
     }
 };
 
-// F6 toggles the solver mid-run. Read by virtual-key code every frame so it
-// works on any keyboard layout and even while another mod's menu has focus
-// of cocos' keyboard dispatcher.
+// F6 toggles the solver, F7 cycles Mode 1 -> 2 -> 3. Keys are read by
+// Windows virtual-key code (VK_F6 / VK_F7), which is the same on every
+// keyboard layout - Turkish Q, Turkish F, AZERTY, QWERTZ... - so nothing
+// depends on which characters the layout puts on the keys. The keys are
+// only read while the Geometry Dash window is the focused window.
+namespace {
+
+#ifdef GEODE_IS_WINDOWS
+bool gameFocused() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+bool keyPressedEdge(int vk, bool& wasDown, bool focused) {
+    bool down = focused && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    bool edge = down && !wasDown;
+    wasDown = down;
+    return edge;
+}
+#endif
+
+} // namespace
+
 class $modify(PathfinderScheduler, CCScheduler) {
     void update(float dt) {
         CCScheduler::update(dt);
 #ifdef GEODE_IS_WINDOWS
-        static bool wasDown = false;
-        bool focused = GetForegroundWindow() != nullptr &&
-                       GetForegroundWindow() == GetActiveWindow();
-        bool down = focused && (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-        if (down && !wasDown) {
-            if (auto pl = PlayLayer::get()) {
-                solver().toggle(pl);
-                Notification::create(solver().enabled() ? "Pathfinder ON" : "Pathfinder OFF",
-                                     NotificationIcon::Info, 0.8f)->show();
-            }
+        static bool f6Down = false;
+        static bool f7Down = false;
+        bool focused = gameFocused();
+        bool f6 = keyPressedEdge(VK_F6, f6Down, focused);
+        bool f7 = keyPressedEdge(VK_F7, f7Down, focused);
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+        if (f6) {
+            solver().toggle(pl);
+            Notification::create(solver().enabled() ? "Pathfinder ON" : "Pathfinder OFF",
+                                 NotificationIcon::Info, 0.8f)->show();
         }
-        wasDown = down;
+        if (f7) {
+            solver().cycleProfile(pl);
+            Notification::create(std::string("Mode ") + pf::profileLabel(solver().profile()),
+                                 NotificationIcon::Info, 1.0f)->show();
+        }
 #endif
     }
 };

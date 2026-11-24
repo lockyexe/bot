@@ -109,6 +109,15 @@ struct Cluster {
     int widen = 0;
     bool pairsAdded = false;
     bool microAdded = false;
+    // Exact frame sweep bookkeeping (Mode 3)
+    float deathX = 0;
+    int nearCrashes = 0;       // crashes within ±5 units of deathX
+    bool sweepAdded = false;
+    uint64_t bestDeath = 0;    // furthest any candidate got
+    int64_t bestPress = -1;    // press tick of that candidate
+    int bestHold = 0;
+    int64_t curPress = -1;     // press tick of the candidate being tried
+    int curHold = 0;
     Trace trace;               // the attempt that died here
     std::vector<Event> attemptPlan; // full plan of that attempt
 };
@@ -148,6 +157,10 @@ public:
     static Pathfinder& get();
 
     bool enabled() const { return m_enabled; }
+    Profile profile() const { return m_profile; }
+    void setProfile(Profile p, PlayLayer* pl);
+    void cycleProfile(PlayLayer* pl) { setProfile(nextProfile(m_profile), pl); }
+    int maxFailures() const;
     void setEnabled(bool on, PlayLayer* pl);
     void toggle(PlayLayer* pl) { setEnabled(!m_enabled, pl); }
 
@@ -202,6 +215,9 @@ private:
     void buildQueue(Segment& s, Cluster& c);
     void addPairs(Segment& s, Cluster& c);
     void addMicro(Segment& s, Cluster& c);
+    void addSweep(Segment& s, Cluster& c);
+    bool respectsCooldown(std::vector<Event> const& base, std::vector<Event> const& cand, uint8_t ch) const;
+    uint64_t nextCpInterval(uint64_t seed) const;
     bool applyNextCandidate(Segment& s);
     void backtrack(PlayLayer* pl);
     uint64_t lookback(Mode m) const;
@@ -212,6 +228,7 @@ private:
     bool safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t tick) const;
 
     bool m_enabled = false;
+    Profile m_profile = Profile::Human;
     bool m_sending = false;
     bool m_inLevel = false;
 
@@ -226,6 +243,8 @@ private:
     // Per-attempt runtime state
     bool m_hold[2] = {false, false};
     uint64_t m_lastToggle[2] = {0, 0};
+    int64_t m_lastPress[2] = {-100000, -100000};
+    float m_vySmooth[2] = {0, 0};
     int64_t m_pendingToggleAt[2] = {-1, -1};
     bool m_pendingToggleTo[2] = {false, false};
     int64_t m_tapReleaseAt[2] = {-1, -1};

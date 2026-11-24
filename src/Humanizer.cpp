@@ -22,15 +22,47 @@ float Humanizer::hash01(uint64_t key) {
     return static_cast<float>(splitmix(key) >> 40) / static_cast<float>(1ull << 24);
 }
 
-HumanParams Humanizer::makeParams(uint64_t seed) {
+char const* profileLabel(Profile p) {
+    switch (p) {
+        case Profile::Human: return "1-Human";
+        case Profile::Prodigy: return "2-Prodigy 15CPS";
+        case Profile::Unreal: return "3-Unreal ILL 15CPS";
+    }
+    return "?";
+}
+
+Profile nextProfile(Profile p) {
+    switch (p) {
+        case Profile::Human: return Profile::Prodigy;
+        case Profile::Prodigy: return Profile::Unreal;
+        case Profile::Unreal: return Profile::Human;
+    }
+    return Profile::Human;
+}
+
+ProfileSpec const& profileSpec(Profile p) {
+    // floor      micro     band          clamp drift       window       ctr  jit damp  cd  checkpoints  fails sweep
+    static ProfileSpec const human{12, 16, 2, 4, 10.f, 16.f, 4.f, 6.f, 12.f, 0.45, 0.65, true, 3, 1.f, 0, 192, 288, 0, false};
+    static ProfileSpec const prodigy{6, 8, 6, 8, 2.5f, 5.f, 1.5f, 2.f, 4.f, 0.35, 0.55, true, 1, 0.35f, 16, 150, 210, 65, false};
+    static ProfileSpec const unreal{1, 1, 1, 1, 0.8f, 1.5f, 0.5f, 0.f, 0.f, 0.0, 1.0, false, 0, 1.f, 16, 85, 130, 120, true};
+    switch (p) {
+        case Profile::Prodigy: return prodigy;
+        case Profile::Unreal: return unreal;
+        default: return human;
+    }
+}
+
+HumanParams Humanizer::makeParams(uint64_t seed, Profile profile) {
+    auto const& sp = profileSpec(profile);
     std::mt19937_64 rng(splitmix(seed));
-    auto uni = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(rng); };
-    auto inti = [&](int a, int b) { return std::uniform_int_distribution<int>(a, b)(rng); };
+    auto uni = [&](float a, float b) { return a >= b ? a : std::uniform_real_distribution<float>(a, b)(rng); };
+    auto inti = [&](int a, int b) { return a >= b ? a : std::uniform_int_distribution<int>(a, b)(rng); };
     HumanParams p;
-    p.baseFloor = inti(12, 16);
-    p.microFloor = inti(2, 4);
-    p.band = uni(10.f, 16.f);
-    p.driftAmp = uni(6.f, 12.f);
+    p.profile = profile;
+    p.baseFloor = inti(sp.floorMin, sp.floorMax);
+    p.microFloor = inti(sp.microMin, sp.microMax);
+    p.band = uni(sp.bandMin, sp.bandMax);
+    p.driftAmp = uni(sp.driftMin, sp.driftMax);
     p.driftFreq = uni(0.007f, 0.016f);
     p.phaseA = uni(0.f, TAU);
     p.phaseB = uni(0.f, TAU);
@@ -40,6 +72,15 @@ HumanParams Humanizer::makeParams(uint64_t seed) {
 
 void Humanizer::reseed(uint64_t seed) {
     m_rng.seed(splitmix(seed ^ m_params.noiseSeed));
+}
+
+bool Humanizer::microAllowed(int spotFailures) const {
+    switch (m_params.profile) {
+        case Profile::Human: return spotFailures > 15;
+        case Profile::Prodigy: return false; // crisp, never 1-frame jitter
+        case Profile::Unreal: return true;   // 1-tick swift releases always allowed
+    }
+    return false;
 }
 
 int Humanizer::minStateTicks(int spotFailures) const {
@@ -65,6 +106,7 @@ float Humanizer::drift(uint64_t tick, float corridorHeight) const {
     float s = 0.55f * std::sin(t * m_params.driftFreq + m_params.phaseA)
             + 0.25f * std::sin(t * m_params.driftFreq * 2.3f + m_params.phaseB)
             + 0.20f * perlin(t * m_params.driftFreq * 1.7f);
+    if (m_params.driftAmp <= 0.f) return 0.f;
     // Never let the drift eat more than 15% of a tight corridor.
     float amp = std::min(m_params.driftAmp, std::max(0.f, corridorHeight * 0.15f));
     return s * amp;
@@ -72,18 +114,42 @@ float Humanizer::drift(uint64_t tick, float corridorHeight) const {
 
 float Humanizer::band(float corridorHeight, float scale) const {
     float b = m_params.band * scale;
-    // Keep the band inside the corridor, but never collapse to 1-tick flying.
-    float maxB = std::max(4.f, corridorHeight * 0.5f - 6.f);
-    return std::clamp(b, 4.f, maxB);
+    float lo = spec().bandClamp;
+    // Keep the band inside the corridor, but never collapse below the profile's floor.
+    float maxB = std::max(lo, corridorHeight * 0.5f - 6.f);
+    return std::clamp(b, lo, maxB);
 }
 
-std::vector<uint64_t> Humanizer::centeredOrder(uint64_t a, uint64_t b, int step) {
+std::vector<uint64_t> Humanizer::orderWindow(HumanParams const& p, uint64_t a, uint64_t b, int step, uint64_t salt) {
+    auto const& sp = profileSpec(p.profile);
+    if (!sp.centered) {
+        std::vector<uint64_t> out;
+        if (b < a) return out;
+        for (uint64_t t = a; t <= b; t += static_cast<uint64_t>(std::max(step, 1))) out.push_back(t);
+        return out;
+    }
+    auto out = centeredOrder(a, b, step, sp.centerLo, sp.centerHi);
+    if (sp.jitterVariance == 1) {
+        // ±1 tick organic variance, deterministic per window/tick.
+        for (auto& t : out) {
+            float h = hash01(t * 0x9E37ull + salt + p.noiseSeed);
+            if (h < 0.3f && t > a) t -= 1;
+            else if (h > 0.7f && t < b) t += 1;
+        }
+        std::vector<uint64_t> dedup;
+        for (auto t : out) if (std::find(dedup.begin(), dedup.end(), t) == dedup.end()) dedup.push_back(t);
+        out = std::move(dedup);
+    }
+    return out;
+}
+
+std::vector<uint64_t> Humanizer::centeredOrder(uint64_t a, uint64_t b, int step, double loF, double hiF) {
     std::vector<uint64_t> out;
     if (b < a) return out;
     step = std::max(step, 1);
     double len = static_cast<double>(b - a);
-    double lo = static_cast<double>(a) + len * 0.45;
-    double hi = static_cast<double>(a) + len * 0.65;
+    double lo = static_cast<double>(a) + len * loF;
+    double hi = static_cast<double>(a) + len * hiF;
     for (uint64_t t = a; t <= b; t += static_cast<uint64_t>(step)) out.push_back(t);
     auto dist = [&](uint64_t t) {
         double d = static_cast<double>(t);
@@ -100,13 +166,6 @@ std::vector<uint64_t> Humanizer::centeredOrder(uint64_t a, uint64_t b, int step)
     return out;
 }
 
-uint64_t Humanizer::pickCentered(uint64_t a, uint64_t b) {
-    if (b <= a) return a;
-    double len = static_cast<double>(b - a);
-    double f = std::uniform_real_distribution<double>(0.45, 0.65)(m_rng);
-    return a + static_cast<uint64_t>(std::llround(len * f));
-}
-
 bool Humanizer::recentlyPeriodic() const {
     if (m_toggles.size() < 5) return false;
     std::vector<uint64_t> v(m_toggles.end() - 5, m_toggles.end());
@@ -115,6 +174,9 @@ bool Humanizer::recentlyPeriodic() const {
 
 int Humanizer::toggleJitter(bool safe) {
     if (!safe) return 0;
+    int variance = spec().jitterVariance;
+    if (variance == 0) return 0;                                              // Unreal: exact
+    if (variance == 1) return std::uniform_int_distribution<int>(0, 1)(m_rng); // Prodigy: ±1
     bool periodic = recentlyPeriodic();
     // Mostly 0-1 tick of natural slop, 1-3 when the rhythm got robotic.
     int lo = periodic ? 1 : 0;

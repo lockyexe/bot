@@ -13,10 +13,26 @@ Every push to `main` builds on GitHub Actions. Grab `lockyexe.practice-pathfinde
 
 1. Open the level, enter **Practice Mode**.
 2. Set your speed (e.g. 0.3x) and start recording in your macro bot.
-3. Press **F6**. The label in the top-right shows `[Pathfinder: ON | CPs | Seg Attempts | Mode]`.
+3. Press **F6**, pick a mode with **F7**. The label in the top-right shows `[Pathfinder: ON (F6) | Mode: ... (F7) | CPs | Attempts]`.
 4. Let it run. It places checkpoints by itself; your recorder's practice fix handles respawns.
 
 Your own clicks are ignored while it's on (setting), so they don't end up in the macro.
+
+## Modes (F7 cycles 1 -> 2 -> 3)
+
+| | 1-Human | 2-Prodigy 15CPS | 3-Unreal ILL 15CPS |
+| --- | --- | --- | --- |
+| Min hold / release | 12-16 ticks (2-4 after >15 fails) | 6-8 ticks, never micro | 1-tick swift releases allowed |
+| Click cap | none | >= 16 ticks between presses (15 CPS) | >= 16 ticks between presses (15 CPS) |
+| Ship/wave band | ±10-16 + drift | ±2.5-5 + damped curve | ±0.8-1.5, no drift |
+| Timing bias | 45-65% of window | 35-55% ±1 tick | none (chronological) |
+| Jitter | 0-3 ticks | 0-1 tick | none |
+| Auto checkpoint | 192-288 ticks | 150-210 ticks | 85-130 ticks |
+| Backtrack after | 35 fails (setting) | 65 fails | 120 fails |
+| Extra | | | >10 crashes within ±5 units → exact -8..+8 tick sweep (swift + sustained) |
+
+All timings are physics ticks (240/s of game time), so it behaves the same at 1.0x or any speedhack.
+F6/F7 are read by virtual-key code, so they work on Turkish Q/F and any other layout.
 
 ## How it works
 

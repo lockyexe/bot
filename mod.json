@@ -5,7 +5,7 @@
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.0.0",
+	"version": "v1.1.0",
 	"developer": "lockyexe",
 	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases",
 	"tags": [
@@ -16,7 +16,7 @@
 		"enabled": {
 			"type": "bool",
 			"name": "Start enabled",
-			"description": "Turn the solver on as soon as you enter a level. You can always toggle it mid-run with <cy>F6</c>. It only plays while you are in <cg>Practice Mode</c>.",
+			"description": "Turn the solver on as soon as you enter a level. Toggle it mid-run with <cy>F6</c>, switch Mode 1 / 2 / 3 with <cy>F7</c>. Works on any keyboard layout (Turkish too). It only plays while you are in <cg>Practice Mode</c>.",
 			"default": false
 		},
 		"auto-checkpoints": {
@@ -27,8 +27,8 @@
 		},
 		"max-failures": {
 			"type": "int",
-			"name": "Failures before backtracking",
-			"description": "When a checkpoint collects more deaths than this, it is treated as a doomed spot: the solver deletes it and goes back to the previous checkpoint.",
+			"name": "Failures before backtracking (Mode 1)",
+			"description": "Mode 1 only: when a checkpoint collects more deaths than this, it is deleted and the solver goes back to the previous checkpoint. Mode 2 uses 65 and Mode 3 uses 120.",
 			"default": 35,
 			"min": 10,
 			"max": 200,

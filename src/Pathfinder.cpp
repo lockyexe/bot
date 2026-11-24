@@ -25,9 +25,6 @@ void fnv(uint64_t& h, uint64_t v) {
 
 bool settingBool(char const* key) { return Mod::get()->getSettingValue<bool>(key); }
 
-int maxFailures() {
-    return static_cast<int>(std::clamp<int64_t>(Mod::get()->getSettingValue<int64_t>("max-failures"), 10, 200));
-}
 
 std::optional<ObjKind> classify(GameObjectType t) {
     switch (t) {
@@ -128,6 +125,38 @@ Pathfinder& Pathfinder::get() {
     return inst;
 }
 
+int Pathfinder::maxFailures() const {
+    int fixed = profileSpec(m_profile).maxFailures;
+    if (fixed > 0) return fixed; // Mode 2: 65, Mode 3: 120
+    return static_cast<int>(std::clamp<int64_t>(Mod::get()->getSettingValue<int64_t>("max-failures"), 10, 200));
+}
+
+uint64_t Pathfinder::nextCpInterval(uint64_t seed) const {
+    auto const& sp = profileSpec(m_profile);
+    auto span = static_cast<float>(sp.cpMax - sp.cpMin + 1);
+    return sp.cpMin + std::min<uint64_t>(sp.cpMax - sp.cpMin, static_cast<uint64_t>(Humanizer::hash01(seed) * span));
+}
+
+void Pathfinder::setProfile(Profile p, PlayLayer* pl) {
+    (void)pl;
+    m_profile = p;
+    Mod::get()->setSavedValue<int64_t>("profile", static_cast<int64_t>(p));
+    m_status = fmt::format("Mode {}", profileLabel(p));
+    if (m_segments.empty()) return;
+    auto& s = seg();
+    s.human = Humanizer::makeParams(s.startTick * 31 + m_segments.size() * 7919 + 17 + static_cast<uint64_t>(p), p);
+    m_human.setParams(s.human);
+    m_human.clearHistory();
+    m_cpInterval = nextCpInterval(m_lastCheckpointTick * 13 + static_cast<uint64_t>(p));
+    m_pendingToggleAt[0] = m_pendingToggleAt[1] = -1;
+    if (s.cluster) {
+        // Re-plan the spot being fixed with the new profile's rules.
+        auto& c = *s.cluster;
+        c.pairsAdded = c.microAdded = c.sweepAdded = false;
+        buildQueue(s, c);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // state / lifecycle
 // ---------------------------------------------------------------------------
@@ -172,6 +201,10 @@ void Pathfinder::setEnabled(bool on, PlayLayer* pl) {
 void Pathfinder::onLevelInit(PlayLayer* pl) {
     m_inLevel = true;
     m_enabled = settingBool("enabled");
+    {
+        auto saved = Mod::get()->getSavedValue<int64_t>("profile", 1);
+        m_profile = static_cast<Profile>(std::clamp<int64_t>(saved, 1, 3));
+    }
     m_segments.clear();
     m_index.clear();
     m_wide.clear();
@@ -209,7 +242,7 @@ Segment Pathfinder::makeSegment(uint64_t startTick, bool hold0, bool hold1, bool
     s.startHold[0] = hold0;
     s.startHold[1] = hold1;
     s.ours = ours;
-    s.human = Humanizer::makeParams(startTick * 31 + m_segments.size() * 7919 + 17);
+    s.human = Humanizer::makeParams(startTick * 31 + m_segments.size() * 7919 + 17, m_profile);
     if (hold0) s.plan.push_back({startTick, true, 0});
     if (hold1) s.plan.push_back({startTick, true, 1});
     s.lockedUntil = (hold0 || hold1) ? startTick + 1 : startTick;
@@ -234,7 +267,7 @@ void Pathfinder::onCheckpointAdded(PlayLayer* pl, uint64_t tick, bool ours) {
     m_trace.base = tick;
     m_lastCheckpointTick = tick;
     m_lastSpecialPass = 0;
-    m_cpInterval = 192 + static_cast<uint64_t>(Humanizer::hash01(tick * 13 + 5) * 96.f); // 0.8 - 1.2 s
+    m_cpInterval = nextCpInterval(tick * 13 + 5); // per-profile tick range
     m_human.setParams(seg().human);
     m_human.clearHistory();
     m_status = "Checkpoint placed";
@@ -255,6 +288,8 @@ void Pathfinder::onReset(PlayLayer* pl) {
         m_havePrevY[c] = false;
         m_modeKnown[c] = false;
         m_lastToggle[c] = 0;
+        m_lastPress[c] = -100000;
+        m_vySmooth[c] = 0.f;
     }
     m_deathHandled = false;
     m_pendingCheckpoint = false;
@@ -275,7 +310,10 @@ void Pathfinder::onReset(PlayLayer* pl) {
     m_trace = {};
     m_trace.base = now;
     m_lastCheckpointTick = now;
-    m_cpInterval = 192 + static_cast<uint64_t>(Humanizer::hash01(now * 13 + s.attempts) * 96.f);
+    m_cpInterval = nextCpInterval(now * 13 + s.attempts);
+    if (s.human.profile != m_profile) {
+        s.human = Humanizer::makeParams(s.startTick * 31 + m_segments.size() * 7919 + 17 + static_cast<uint64_t>(m_profile), m_profile);
+    }
     m_human.setParams(s.human);
     m_human.reseed(now * 1000003ull + static_cast<uint64_t>(s.attempts) * 7 + m_segments.size());
     m_human.clearHistory();
@@ -471,6 +509,7 @@ void Pathfinder::press(PlayLayer* pl, uint8_t ch, bool down, uint64_t tick, bool
     m_sending = false;
     m_hold[ch] = down;
     m_lastToggle[ch] = tick;
+    if (down) m_lastPress[ch] = static_cast<int64_t>(tick);
     if (ch == 0) m_human.noteToggle(tick);
     if (record && !m_segments.empty()) seg().plan.push_back({tick, down, ch});
 }
@@ -543,7 +582,7 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
         default: break;
     }
     leadTicks = std::max(1, static_cast<int>(std::lround(static_cast<float>(leadTicks) * fp.leadScale)));
-    float py = s.y + s.vy * static_cast<float>(leadTicks);
+    float py = s.y + m_vySmooth[ch] * static_cast<float>(leadTicks);
     float lowEdge = center - band;
     float highEdge = center + band;
     bool up = !s.upsideDown; // pressing pushes towards +y in normal gravity
@@ -575,6 +614,10 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
     }
     if (!want) return std::nullopt;
 
+    // 15 CPS hard cap (Modes 2/3): >= 16 ticks between two presses.
+    int cooldown = m_human.pressCooldown();
+    if (*want && cooldown > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cooldown) return std::nullopt;
+
     uint64_t since = tick - m_lastToggle[ch];
     if (since < static_cast<uint64_t>(floorT)) {
         // Hold/release floor. Only an about-to-crash prediction on a spot
@@ -588,7 +631,8 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
     bool safe = py > c.yMin + band * 0.5f && py < c.yMax - band * 0.5f;
     int jitter = m_human.toggleJitter(safe);
     if (*want && isTap) {
-        int tapLen = floorT + static_cast<int>(Humanizer::hash01(tick * 7 + ch) * 4.f);
+        int tapLen = floorT;
+        if (m_human.spec().jitterVariance > 0) tapLen += static_cast<int>(Humanizer::hash01(tick * 7 + ch) * 4.f);
         m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + jitter + tapLen;
     }
     if (jitter > 0) {
@@ -610,6 +654,8 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     if (s.mode != Mode::Cube && s.mode != Mode::Robot) return std::nullopt;
     if (!s.onGround || s.vx <= 0.5f) return std::nullopt;
     if (tick - m_lastToggle[ch] < static_cast<uint64_t>(floorT)) return std::nullopt;
+    int cooldown = m_human.pressCooldown();
+    if (cooldown > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cooldown) return std::nullopt;
 
     float air = s.mode == Mode::Robot ? 70.f : (s.mini ? 72.f : 88.f);
     float span = s.vx * air;
@@ -632,7 +678,12 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     if (m_assistJumpedFor == key) return std::nullopt;
     // Valid take-off window is roughly 8%-34% of a jump's length before the
     // spike; aim for the 45-65% middle of that window, per-spike.
-    float frac = 0.08f + 0.26f * (0.45f + 0.20f * Humanizer::hash01(key));
+    float frac = 0.08f + 0.26f * (0.45f + 0.20f * Humanizer::hash01(key)); // Mode 1: 45-65%
+    switch (m_human.params().profile) {
+        case Profile::Prodigy: frac = 0.08f + 0.26f * (0.35f + 0.20f * Humanizer::hash01(key)); break; // 35-55%
+        case Profile::Unreal: frac = 0.08f + 0.26f * 0.5f; break; // no centering bias, no variance
+        default: break;
+    }
     if (best <= frac * span) {
         m_assistJumpedFor = key;
         return true;
@@ -673,6 +724,12 @@ void Pathfinder::onTick(PlayLayer* pl) {
         PlayerSnap s = snap(p, ch);
         if (!s.valid) continue;
         updateBounds(ch, s);
+        {
+            // Damped vertical speed: Mode 2 reacts to a smoothed curve, which
+            // gives straight-fly a soft organic arc. Modes 1/3 use raw speed.
+            float a = std::clamp(m_human.vyDamping(), 0.05f, 1.f);
+            m_vySmooth[ch] = (a >= 1.f) ? s.vy : m_vySmooth[ch] + (s.vy - m_vySmooth[ch]) * a;
+        }
         bool orb = touchingOrb(s);
 
         auto& sg = seg();
@@ -871,6 +928,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         sortEvents(cand.events);
         cand.key = candidateKey(c.base, cand);
         if (s.tried.count(cand.key) || seen.count(cand.key)) return;
+        if (!cand.live && !respectsCooldown(c.base, cand.events, c.ch)) return;
         seen.insert(cand.key);
         out.push_back(std::move(cand));
     };
@@ -928,7 +986,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
             if (on && !inRun) { inRun = true; runStart = t; }
             if (!on && inRun) {
                 inRun = false;
-                auto order = Humanizer::centeredOrder(runStart, t - 1);
+                auto order = Humanizer::orderWindow(s.human, runStart, t - 1, 1, runStart);
                 for (size_t i = 0; i < order.size(); i++) anchors.push_back({order[i], groupBase + group * 2 + i * 1.0});
                 group++;
             }
@@ -942,7 +1000,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
             if (!a || !b) continue;
             if (a->onGround && !b->onGround && !a->hold && !b->hold) {
                 uint64_t lo = t > ws + 18 ? t - 18 : ws;
-                auto order = Humanizer::centeredOrder(lo, t);
+                auto order = Humanizer::orderWindow(s.human, lo, t, 1, lo);
                 for (size_t i = 0; i < order.size(); i++) anchors.push_back({order[i], groupBase + 20 + i * 1.0});
             }
         }
@@ -960,7 +1018,8 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         uint64_t ideal = d > lead ? d - lead : ws;
         ideal = std::clamp(ideal, ws, d - 1);
         std::vector<uint64_t> ticks;
-        for (uint64_t t = ws; t + 1 < d; t += 2) ticks.push_back(t);
+        uint64_t step = s.human.profile == Profile::Unreal ? 1 : 2; // Mode 3 sweeps every tick
+        for (uint64_t t = ws; t + 1 < d; t += step) ticks.push_back(t);
         std::stable_sort(ticks.begin(), ticks.end(), [&](uint64_t a, uint64_t b) {
             auto da = a > ideal ? a - ideal : ideal - a;
             auto db = b > ideal ? b - ideal : ideal - b;
@@ -970,12 +1029,23 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
     }
 
     std::vector<int> lengths;
-    switch (c.mode) {
-        case Mode::Cube: lengths = {floorT, floorT + 12, 44}; break;
-        case Mode::Robot: lengths = {floorT, 24, 34, 48}; break;
-        case Mode::Ship:
-        case Mode::Wave: lengths = {floorT, 26, 44}; break;
-        default: lengths = {floorT}; break;
+    if (s.human.profile == Profile::Unreal) {
+        // 1-tick swift releases first, then sustained holds.
+        switch (c.mode) {
+            case Mode::Cube: lengths = {1, 12, 44}; break;
+            case Mode::Robot: lengths = {1, 24, 34, 48}; break;
+            case Mode::Ship:
+            case Mode::Wave: lengths = {1, 8, 26, 44}; break;
+            default: lengths = {1, 8}; break;
+        }
+    } else {
+        switch (c.mode) {
+            case Mode::Cube: lengths = {floorT, floorT + 12, 44}; break;
+            case Mode::Robot: lengths = {floorT, 24, 34, 48}; break;
+            case Mode::Ship:
+            case Mode::Wave: lengths = {floorT, 26, 44}; break;
+            default: lengths = {floorT}; break;
+        }
     }
 
     std::unordered_set<uint64_t> usedTick;
@@ -1000,8 +1070,9 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
     std::stable_sort(out.begin(), out.end(), [](Candidate const& a, Candidate const& b) { return a.score < b.score; });
 
     // Anti-robot filter: push candidates whose resulting click rhythm is
-    // machine-regular behind otherwise-equal ones.
+    // machine-regular behind otherwise-equal ones. (Off in Mode 3: exact play.)
     for (auto& cand : out) {
+        if (s.human.profile == Profile::Unreal) break;
         std::vector<uint64_t> ticks;
         for (auto const& e : c.base) if (e.ch == c.ch && e.tick + 400 >= ws) ticks.push_back(e.tick);
         for (auto const& e : cand.events) ticks.push_back(e.tick);
@@ -1040,7 +1111,7 @@ void Pathfinder::addPairs(Segment& s, Cluster& c) {
             sortEvents(p.events);
             p.key = candidateKey(c.base, p);
             p.score = sc++;
-            if (!s.tried.count(p.key)) pairs.push_back(std::move(p));
+            if (!s.tried.count(p.key) && respectsCooldown(c.base, p.events, c.ch)) pairs.push_back(std::move(p));
         }
     }
     c.queue.insert(c.queue.end(), pairs.begin(), pairs.end());
@@ -1048,6 +1119,7 @@ void Pathfinder::addPairs(Segment& s, Cluster& c) {
 
 void Pathfinder::addMicro(Segment& s, Cluster& c) {
     c.microAdded = true;
+    if (s.human.profile == Profile::Prodigy) return; // crisp 6-8 tick inputs only
     int micro = s.human.microFloor;
     uint64_t ws = c.windowStart;
     uint64_t d = std::max(c.deathTick, ws + 2);
@@ -1076,7 +1148,7 @@ void Pathfinder::addMicro(Segment& s, Cluster& c) {
                 cand.events = {{static_cast<uint64_t>(t), true, c.ch}, {static_cast<uint64_t>(t + micro), false, c.ch}};
             }
             cand.key = candidateKey(c.base, cand);
-            if (!s.tried.count(cand.key)) extra.push_back(std::move(cand));
+            if (!s.tried.count(cand.key) && respectsCooldown(c.base, cand.events, c.ch)) extra.push_back(std::move(cand));
         }
     }
     // Interleave with what is left so micro inputs get a fair chance now.
@@ -1100,6 +1172,12 @@ bool Pathfinder::applyNextCandidate(Segment& s) {
             if (s.tried.count(cand.key)) continue;
             s.tried.insert(cand.key);
 
+            c.curPress = -1;
+            c.curHold = 0;
+            for (auto const& e : cand.events) {
+                if (e.hold && c.curPress < 0) c.curPress = static_cast<int64_t>(e.tick);
+                else if (!e.hold && c.curPress >= 0 && c.curHold == 0) c.curHold = static_cast<int>(e.tick - static_cast<uint64_t>(c.curPress));
+            }
             s.plan = c.base;
             for (auto const& e : cand.events) s.plan.push_back(e);
             sortEvents(s.plan);
@@ -1132,6 +1210,52 @@ bool Pathfinder::applyNextCandidate(Segment& s) {
     return false;
 }
 
+bool Pathfinder::respectsCooldown(std::vector<Event> const& base, std::vector<Event> const& cand, uint8_t ch) const {
+    int cd = profileSpec(m_profile).pressCooldown;
+    if (cd <= 0) return true;
+    std::vector<std::pair<uint64_t, bool>> presses; // tick, from candidate
+    for (auto const& e : base) if (e.ch == ch && e.hold) presses.push_back({e.tick, false});
+    for (auto const& e : cand) if (e.ch == ch && e.hold) presses.push_back({e.tick, true});
+    std::sort(presses.begin(), presses.end());
+    for (size_t i = 1; i < presses.size(); i++) {
+        if (!presses[i].second && !presses[i - 1].second) continue; // old inputs aren't re-judged
+        if (presses[i].first - presses[i - 1].first < static_cast<uint64_t>(cd)) return false;
+    }
+    return true;
+}
+
+void Pathfinder::addSweep(Segment& s, Cluster& c) {
+    c.sweepAdded = true;
+    uint64_t ws = c.windowStart;
+    uint64_t d = std::max(c.deathTick, ws + 2);
+    int64_t anchor = c.bestPress >= 0 ? c.bestPress : static_cast<int64_t>(d > 20 ? d - 20 : ws);
+    int sustained = c.bestHold > 1 ? c.bestHold : 12;
+    bool holdAtWs = stateFrom(c.base, c.ch, ws, false);
+
+    std::vector<Candidate> sweep;
+    for (int off = -8; off <= 8; off++) {
+        int64_t t = anchor + off;
+        if (t < static_cast<int64_t>(ws) || t > static_cast<int64_t>(d) + 8) continue;
+        auto tt = static_cast<uint64_t>(t);
+        std::vector<std::vector<Event>> variants = {
+            {{tt, true, c.ch}, {tt + 1, false, c.ch}},                                       // 1-tick swift
+            {{tt, true, c.ch}, {tt + static_cast<uint64_t>(sustained), false, c.ch}},        // sustained hold
+        };
+        if (holdAtWs) variants.push_back({{tt, false, c.ch}});                               // release here
+        for (auto& v : variants) {
+            Candidate cand;
+            if (holdAtWs && v.size() > 1) cand.events.push_back({ws, false, c.ch});
+            for (auto const& e : v) cand.events.push_back(e);
+            sortEvents(cand.events);
+            cand.key = candidateKey(c.base, cand);
+            if (s.tried.count(cand.key) || !respectsCooldown(c.base, cand.events, c.ch)) continue;
+            sweep.push_back(std::move(cand));
+        }
+    }
+    c.queue.insert(c.queue.begin() + static_cast<std::ptrdiff_t>(c.next), sweep.begin(), sweep.end());
+    m_status = fmt::format("Frame sweep around tick {} ({} tries)", anchor, sweep.size());
+}
+
 void Pathfinder::backtrack(PlayLayer* pl) {
     for (int depth = 0; depth < 4 && m_segments.size() > 1; depth++) {
         uint64_t childStart = m_segments.back().startTick;
@@ -1149,6 +1273,7 @@ void Pathfinder::backtrack(PlayLayer* pl) {
         Mode mode = Mode::Cube;
         if (auto tt = parent.lastTrace.at(0, childStart > 0 ? childStart - 1 : 0)) mode = tt->mode;
         openCluster(parent, childStart, 0, mode, 0, true, parent.lastTrace, parent.plan);
+        if (auto tt = parent.lastTrace.at(0, childStart > 0 ? childStart - 1 : 0)) parent.cluster->deathX = tt->x;
         m_status = fmt::format("Backtracked: checkpoint {} was a dead end", m_segments.size());
         if (parent.failures <= maxFailures() && applyNextCandidate(parent)) return;
     }
@@ -1201,6 +1326,14 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
         bool worseInWindow = tick < c.deathTick && tick >= c.windowStart;
         if (sameSpot || worseInWindow) {
             c.tries++;
+            if (tick > c.bestDeath && c.curPress >= 0) {
+                c.bestDeath = tick;
+                c.bestPress = c.curPress;
+                c.bestHold = c.curHold;
+            }
+            if (std::abs(ps.x - c.deathX) <= 5.f) c.nearCrashes++;
+            // Mode 3: stuck on the same obstacle >10 times -> exact frame sweep.
+            if (profileSpec(m_profile).frameSweep && c.nearCrashes > 10 && !c.sweepAdded) addSweep(s, c);
             if (!applyNextCandidate(s)) {
                 if (m_segments.size() > 1) backtrack(pl);
                 else {
@@ -1213,6 +1346,8 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
         }
     }
     openCluster(s, tick, ch, mode, side, false, m_trace, s.plan);
+    s.cluster->deathX = ps.x;
+    s.cluster->nearCrashes = 1;
     if (!applyNextCandidate(s) && m_segments.size() > 1) backtrack(pl);
 }
 
@@ -1223,8 +1358,8 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
 std::string Pathfinder::hudText(PlayLayer* pl) const {
     size_t cps = pl && pl->m_checkpointArray ? pl->m_checkpointArray->count() : 0;
     int segFails = m_segments.empty() ? 0 : m_segments.back().failures;
-    std::string line = fmt::format("[Pathfinder: {} | CPs: {} | Seg Attempts: {}/{} | Mode: Humanized]",
-                                   m_enabled ? "ON" : "OFF", cps, segFails, maxFailures());
+    std::string line = fmt::format("[Pathfinder: {} (F6) | Mode: {} (F7) | CPs: {} | Attempts: {}/{}]",
+                                   m_enabled ? "ON" : "OFF", profileLabel(m_profile), cps, segFails, maxFailures());
     if (!m_status.empty()) line += "\n" + m_status;
     return line;
 }
