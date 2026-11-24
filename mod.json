@@ -1,13 +1,16 @@
 {
 	"geode": "5.11.2",
 	"gd": {
-		"win": "2.2081"
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.5.0",
+	"version": "v1.6.0",
 	"developer": "lockyexe",
-	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases",
+	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases (PC, Android, iOS, Mac)",
 	"tags": [
 		"gameplay",
 		"utility"
@@ -16,7 +19,7 @@
 		"enabled": {
 			"type": "bool",
 			"name": "Start enabled",
-			"description": "Turn the solver on as soon as you enter a level. Toggle it mid-run with <cy>F6</c>, switch Mode 1 / 2 / 3 with <cy>F7</c>. Works on any keyboard layout (Turkish too). It only plays while you are in <cg>Practice Mode</c>.",
+			"description": "Turn the solver on as soon as you enter a level. Toggle it mid-run with <cy>F6</c> (PC) or the <cy>PF</c> button, switch Mode 1 / 2 / 3 with <cy>F7</c> or the <cy>M</c> button. Keys work on any keyboard layout (Turkish too). It only plays while you are in <cg>Practice Mode</c>.",
 			"default": false
 		},
 		"auto-checkpoints": {
@@ -91,6 +94,12 @@
 			"type": "bool",
 			"name": "Brain (physics lookahead)",
 			"description": "Learn the game's physics while playing and simulate ahead: click before a predicted crash, inside the timing window that's predicted to work, and try the fixes predicted to pass first. The learned physics are kept between sessions.",
+			"default": true
+		},
+		"touch-buttons": {
+			"type": "bool",
+			"name": "On-screen buttons",
+			"description": "Show two small buttons on the left side of the level: <cy>PF</c> turns the solver on/off and <cy>M1/M2/M3</c> switches the mode. Needed on phones and tablets; on PC you can also use F6/F7.",
 			"default": true
 		}
 	}

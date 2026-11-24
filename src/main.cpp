@@ -35,6 +35,17 @@ namespace {
 
 pf::Pathfinder& solver() { return pf::Pathfinder::get(); }
 
+// Shared by the keys (F6/F7) and the on-screen buttons.
+void toggleSolver(PlayLayer* pl) {
+    solver().toggle(pl);
+    Notification::create(solver().enabled() ? "Pathfinder ON" : "Pathfinder OFF", NotificationIcon::Info, 0.8f)->show();
+}
+
+void cycleMode(PlayLayer* pl) {
+    solver().cycleProfile(pl);
+    Notification::create(std::string("Mode ") + pf::profileLabel(solver().profile()), NotificationIcon::Info, 1.0f)->show();
+}
+
 bool isMainPlayLayer(GJBaseGameLayer* layer) {
     auto pl = PlayLayer::get();
     return pl && static_cast<GJBaseGameLayer*>(pl) == layer;
@@ -59,6 +70,8 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
     struct Fields {
         CCLabelBMFont* hud = nullptr;
         std::string lastText;
+        ButtonSprite* toggleSpr = nullptr;
+        ButtonSprite* modeSpr = nullptr;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -76,8 +89,44 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
         label->setVisible(Mod::get()->getSettingValue<bool>("show-hud"));
         this->addChild(label, 1000);
         m_fields->hud = label;
+        if (Mod::get()->getSettingValue<bool>("touch-buttons")) addTouchButtons();
         updateHud();
         return true;
+    }
+
+    // On-screen buttons for phones/tablets (and anyone who'd rather tap):
+    // "PF" = solver on/off (same as F6), "M1/M2/M3" = cycle mode (same as F7).
+    void addTouchButtons() {
+        auto win = CCDirector::get()->getWinSize();
+        auto menu = CCMenu::create();
+        menu->setID("pathfinder-buttons"_spr);
+        auto toggleSpr = ButtonSprite::create("PF", "bigFont.fnt", "GJ_button_04.png", 0.8f);
+        toggleSpr->setScale(0.6f);
+        auto modeSpr = ButtonSprite::create("M1", "bigFont.fnt", "GJ_button_04.png", 0.8f);
+        modeSpr->setScale(0.6f);
+        auto toggleBtn = CCMenuItemSpriteExtra::create(toggleSpr, this, menu_selector(PathfinderPlayLayer::onPFToggle));
+        toggleBtn->setID("toggle-button"_spr);
+        auto modeBtn = CCMenuItemSpriteExtra::create(modeSpr, this, menu_selector(PathfinderPlayLayer::onPFMode));
+        modeBtn->setID("mode-button"_spr);
+        menu->addChild(toggleBtn);
+        menu->addChild(modeBtn);
+        menu->alignItemsVerticallyWithPadding(6.f);
+        menu->setPosition({30.f, win.height * 0.62f});
+        // Inside the UI layer, like the pause button, so taps reach it.
+        if (m_uiLayer) m_uiLayer->addChild(menu, 100);
+        else this->addChild(menu, 1000);
+        m_fields->toggleSpr = toggleSpr;
+        m_fields->modeSpr = modeSpr;
+    }
+
+    void onPFToggle(CCObject*) {
+        toggleSolver(this);
+        updateHud();
+    }
+
+    void onPFMode(CCObject*) {
+        cycleMode(this);
+        updateHud();
     }
 
     void updateHud() {
@@ -91,6 +140,17 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
             m_fields->lastText = text;
             label->setString(text.c_str());
             label->setColor(solver().enabled() ? ccColor3B{140, 255, 140} : ccColor3B{255, 255, 255});
+        }
+        updateButtons();
+    }
+
+    void updateButtons() {
+        if (auto spr = m_fields->modeSpr) {
+            auto text = fmt::format("M{}", static_cast<int>(solver().profile()));
+            if (spr->m_label && text != spr->m_label->getString()) spr->setString(text.c_str());
+        }
+        if (auto spr = m_fields->toggleSpr) {
+            spr->setColor(solver().enabled() ? ccColor3B{140, 255, 140} : ccColor3B{255, 255, 255});
         }
     }
 
@@ -170,16 +230,8 @@ class $modify(PathfinderScheduler, CCScheduler) {
         bool f7 = keyPressedEdge(VK_F7, f7Down, focused);
         auto pl = PlayLayer::get();
         if (!pl) return;
-        if (f6) {
-            solver().toggle(pl);
-            Notification::create(solver().enabled() ? "Pathfinder ON" : "Pathfinder OFF",
-                                 NotificationIcon::Info, 0.8f)->show();
-        }
-        if (f7) {
-            solver().cycleProfile(pl);
-            Notification::create(std::string("Mode ") + pf::profileLabel(solver().profile()),
-                                 NotificationIcon::Info, 1.0f)->show();
-        }
+        if (f6) toggleSolver(pl);
+        if (f7) cycleMode(pl);
 #endif
     }
 };

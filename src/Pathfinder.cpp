@@ -2288,8 +2288,16 @@ void Pathfinder::rankWithBrain(Segment& s, Cluster& c) {
 std::string Pathfinder::hudText(PlayLayer* pl) const {
     size_t cps = pl && pl->m_checkpointArray ? pl->m_checkpointArray->count() : 0;
     int segFails = m_segments.empty() ? 0 : m_segments.back().failures;
-    std::string line = fmt::format("[Pathfinder: {} (F6) | Mode: {} (F7) | CPs: {} | Attempts: {}/{}]",
-                                   m_enabled ? "ON" : "OFF", profileLabel(m_profile), cps, segFails, maxFailures());
+#ifdef GEODE_IS_MOBILE
+    constexpr char const* toggleKey = "PF";
+    constexpr char const* modeKey = "M";
+#else
+    constexpr char const* toggleKey = "F6";
+    constexpr char const* modeKey = "F7";
+#endif
+    std::string line = fmt::format("[Pathfinder: {} ({}) | Mode: {} ({}) | CPs: {} | Attempts: {}/{}]",
+                                   m_enabled ? "ON" : "OFF", toggleKey, profileLabel(m_profile), modeKey, cps, segFails,
+                                   maxFailures());
     std::string status = m_status;
     if (m_fastForward) status += status.empty() ? ">> fast-forward" : "  >>";
     if (m_fastRespawnBroken) status += " (instant respawn off)";
