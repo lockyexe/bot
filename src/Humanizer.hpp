@@ -98,6 +98,15 @@ public:
 
     static float hash01(uint64_t key);
 
+    // Natural tap length for a quick click (where hold length doesn't change
+    // the physics). Humans don't tap for the exact same time every click:
+    // Mode 1 ~50-90 ms, Mode 2 ~25-55 ms, Mode 3 exact 1 tick.
+    static int tapLength(HumanParams const& p, uint64_t key);
+
+    // Where inside a learned window [lo, hi] this profile likes to click.
+    // Returns hi + 1 when the profile wants exact timing (no relocation).
+    static uint64_t humanSpot(HumanParams const& p, uint64_t lo, uint64_t hi, uint64_t key);
+
 private:
     float perlin(float t) const;
     bool recentlyPeriodic() const;

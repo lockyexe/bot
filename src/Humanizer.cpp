@@ -52,6 +52,31 @@ ProfileSpec const& profileSpec(Profile p) {
     }
 }
 
+int Humanizer::tapLength(HumanParams const& p, uint64_t key) {
+    float h = hash01(key * 0xA24BAED4963EE407ull + p.noiseSeed);
+    // Skew towards shorter taps like real clicks (h^1.6).
+    float k = std::pow(h, 1.6f);
+    switch (p.profile) {
+        case Profile::Human: {
+            int hi = std::max(p.baseFloor, 22);
+            return p.baseFloor + static_cast<int>(k * static_cast<float>(hi - p.baseFloor + 1) * 0.999f);
+        }
+        case Profile::Prodigy: {
+            int hi = std::max(p.baseFloor, 13);
+            return p.baseFloor + static_cast<int>(k * static_cast<float>(hi - p.baseFloor + 1) * 0.999f);
+        }
+        case Profile::Unreal: return 1;
+    }
+    return p.baseFloor;
+}
+
+uint64_t Humanizer::humanSpot(HumanParams const& p, uint64_t lo, uint64_t hi, uint64_t key) {
+    auto const& sp = profileSpec(p.profile);
+    if (!sp.centered || hi <= lo) return hi + 1;
+    double f = sp.centerLo + (sp.centerHi - sp.centerLo) * static_cast<double>(hash01(key + p.noiseSeed));
+    return lo + static_cast<uint64_t>(std::llround(static_cast<double>(hi - lo) * f));
+}
+
 HumanParams Humanizer::makeParams(uint64_t seed, Profile profile) {
     auto const& sp = profileSpec(profile);
     std::mt19937_64 rng(splitmix(seed));

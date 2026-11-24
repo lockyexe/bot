@@ -1,7 +1,9 @@
 #include "Pathfinder.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 
 using namespace geode::prelude;
 
@@ -24,7 +26,6 @@ void fnv(uint64_t& h, uint64_t v) {
 }
 
 bool settingBool(char const* key) { return Mod::get()->getSettingValue<bool>(key); }
-
 
 std::optional<ObjKind> classify(GameObjectType t) {
     switch (t) {
@@ -93,6 +94,10 @@ void sortEvents(std::vector<Event>& v) {
 
 int bucketOf(float x) { return static_cast<int>(std::floor(x / 100.f)); }
 
+int64_t absDiff(int64_t a, int64_t b) { return a > b ? a - b : b - a; }
+
+constexpr uint64_t SKIP_TOKEN_TICKS = 600; // a game respawn timer we beat must fire within this many ticks
+
 } // namespace
 
 char const* modeName(Mode m) {
@@ -120,10 +125,19 @@ TraceTick const* Trace::at(uint8_t ch, uint64_t tick) const {
     return &ticks[ch][idx];
 }
 
+TraceTick const* Trace::last(uint8_t ch) const {
+    if (ch > 1 || ticks[ch].empty()) return nullptr;
+    return &ticks[ch].back();
+}
+
 Pathfinder& Pathfinder::get() {
     static Pathfinder inst;
     return inst;
 }
+
+// ---------------------------------------------------------------------------
+// profile / settings
+// ---------------------------------------------------------------------------
 
 int Pathfinder::maxFailures() const {
     int fixed = profileSpec(m_profile).maxFailures;
@@ -149,6 +163,7 @@ void Pathfinder::setProfile(Profile p, PlayLayer* pl) {
     m_human.clearHistory();
     m_cpInterval = nextCpInterval(m_lastCheckpointTick * 13 + static_cast<uint64_t>(p));
     m_pendingToggleAt[0] = m_pendingToggleAt[1] = -1;
+    s.pendingPolish.reset();
     if (s.cluster) {
         // Re-plan the spot being fixed with the new profile's rules.
         auto& c = *s.cluster;
@@ -176,6 +191,9 @@ bool Pathfinder::shouldBlockManualInput(PlayLayer* pl) const {
 void Pathfinder::setEnabled(bool on, PlayLayer* pl) {
     if (m_enabled == on) return;
     m_enabled = on;
+    m_respawnPending = false;
+    m_skipTokens.clear();
+    m_fastForward = false;
     if (!pl) return;
     if (!on) {
         releaseAll(pl);
@@ -191,6 +209,7 @@ void Pathfinder::setEnabled(bool on, PlayLayer* pl) {
         auto& s = seg();
         s.plan.erase(std::remove_if(s.plan.begin(), s.plan.end(), [&](Event const& e) { return e.tick >= now; }), s.plan.end());
         s.lockedUntil = std::min(s.lockedUntil, now);
+        s.activePolish.reset();
         m_trace = {};
         m_trace.base = now;
         m_lastCheckpointTick = now;
@@ -206,12 +225,20 @@ void Pathfinder::onLevelInit(PlayLayer* pl) {
         m_profile = static_cast<Profile>(std::clamp<int64_t>(saved, 1, 3));
     }
     m_segments.clear();
+    m_doomed.clear();
     m_index.clear();
     m_wide.clear();
+    m_live.clear();
+    m_liveSet.clear();
+    m_liveTick = UINT64_MAX;
     m_trace = {};
     m_totalDeaths = 0;
     m_hold[0] = m_hold[1] = false;
     m_lastTick = UINT64_MAX;
+    m_respawnPending = false;
+    m_skipTokens.clear();
+    m_fastRespawnBroken = false;
+    m_fastForward = false;
     for (int c = 0; c < 2; c++) {
         m_learnedFloor[c].clear();
         m_learnedCeil[c].clear();
@@ -224,11 +251,17 @@ void Pathfinder::onLevelInit(PlayLayer* pl) {
 void Pathfinder::onLevelExit() {
     m_inLevel = false;
     m_segments.clear();
+    m_doomed.clear();
     m_index.clear();
     m_wide.clear();
+    m_live.clear();
+    m_liveSet.clear();
     m_trace = {};
     m_hold[0] = m_hold[1] = false;
     m_pendingCheckpoint = false;
+    m_respawnPending = false;
+    m_skipTokens.clear();
+    m_fastForward = false;
 }
 
 int Pathfinder::channels(PlayLayer* pl) const {
@@ -261,25 +294,50 @@ void Pathfinder::onCheckpointAdded(PlayLayer* pl, uint64_t tick, bool ours) {
     if (m_segments.empty()) syncSegments(pl);
     auto& parent = seg();
     parent.lastTrace = m_trace;
-    parent.lastTrace.base = m_trace.base;
-    m_segments.push_back(makeSegment(tick, m_hold[0], m_hold[1], ours));
+    // A polish still being tested in the parent stays as it is: the run got
+    // past it, so it works.
+    parent.activePolish.reset();
+    Segment child = makeSegment(tick, m_hold[0], m_hold[1], ours);
+    if (auto lt = m_trace.last(0)) {
+        child.startState = *lt;
+        child.hasStartState = true;
+    }
+    m_segments.push_back(std::move(child));
     m_trace = {};
     m_trace.base = tick;
     m_lastCheckpointTick = tick;
     m_lastSpecialPass = 0;
-    m_cpInterval = nextCpInterval(tick * 13 + 5); // per-profile tick range
+    m_cpInterval = nextCpInterval(tick * 13 + 5);
     m_human.setParams(seg().human);
     m_human.clearHistory();
+    m_fastForward = false;
     m_status = "Checkpoint placed";
 }
 
 void Pathfinder::onBeforeReset(PlayLayer* pl) {
     if (!m_inLevel) return;
+    m_wasAliveBeforeReset = pl->m_player1 && !pl->m_player1->m_isDead;
     releaseAll(pl);
 }
 
 void Pathfinder::onReset(PlayLayer* pl) {
     if (!m_inLevel) return;
+
+    // Our instant respawn beat the game's respawn timer. If the game then
+    // resets a live player some other way than through delayedResetLevel,
+    // instant respawn isn't compatible with this setup: switch it off.
+    if (!m_inOwnReset && m_wasAliveBeforeReset && active(pl)) {
+        auto stillPending = std::any_of(m_skipTokens.begin(), m_skipTokens.end(), [&](uint64_t t) {
+            return m_tickCounter - t < SKIP_TOKEN_TICKS;
+        });
+        if (stillPending && !m_fastRespawnBroken) {
+            m_fastRespawnBroken = true;
+            log::warn("Pathfinder: game reset a live player after an instant respawn; turning instant respawn off");
+        }
+    }
+    m_respawnPending = false;
+    m_fastForward = false;
+
     m_hold[0] = m_hold[1] = false;
     m_lastTick = UINT64_MAX;
     for (int c = 0; c < 2; c++) {
@@ -289,14 +347,17 @@ void Pathfinder::onReset(PlayLayer* pl) {
         m_modeKnown[c] = false;
         m_lastToggle[c] = 0;
         m_lastPress[c] = -100000;
+        m_assistHold[c] = 0;
         m_vySmooth[c] = 0.f;
     }
     m_deathHandled = false;
+    m_divergedThisAttempt = false;
     m_pendingCheckpoint = false;
     m_assistJumpedFor = 0;
     m_lastSpecialPass = 0;
+    m_liveTick = UINT64_MAX;
 
-    buildIndex(pl);
+    if (m_index.empty()) buildIndex(pl); // once per level: positions are read live
     syncSegments(pl);
 
     auto now = static_cast<uint64_t>(pl->m_gameState.m_currentProgress);
@@ -318,12 +379,56 @@ void Pathfinder::onReset(PlayLayer* pl) {
     m_human.reseed(now * 1000003ull + static_cast<uint64_t>(s.attempts) * 7 + m_segments.size());
     m_human.clearHistory();
     m_prevXs[0] = m_prevXs[1] = 0;
+    m_prevX = 0;
 
     if (!active(pl)) {
         m_status = m_enabled ? "Enter Practice Mode to start" : "Off (F6 to start)";
     } else if (!s.cluster) {
         m_status = "Exploring";
     }
+}
+
+// ---------------------------------------------------------------------------
+// instant respawn + fast-forward
+// ---------------------------------------------------------------------------
+
+void Pathfinder::onFrame(PlayLayer* pl) {
+    m_frame++;
+    if (!m_respawnPending) return;
+    if (!pl || !active(pl) || !settingBool("instant-respawn") || m_fastRespawnBroken) {
+        m_respawnPending = false;
+        return;
+    }
+    if (!pl->m_player1 || !pl->m_player1->m_isDead) {
+        m_respawnPending = false; // already respawned
+        return;
+    }
+    // Two frames: lets the game finish the death bookkeeping first.
+    if (++m_respawnFrames < 2) return;
+    m_respawnPending = false;
+    m_skipTokens.push_back(m_tickCounter);
+    m_lastFastResetFrame = m_frame;
+    m_inOwnReset = true;
+    pl->delayedResetLevel(); // the same call the game's own respawn timer makes
+    m_inOwnReset = false;
+}
+
+bool Pathfinder::shouldSkipDelayedReset(PlayLayer* pl) {
+    if (m_inOwnReset) return false;
+    m_skipTokens.erase(std::remove_if(m_skipTokens.begin(), m_skipTokens.end(),
+                                      [&](uint64_t t) { return m_tickCounter - t >= SKIP_TOKEN_TICKS; }),
+                       m_skipTokens.end());
+    if (m_skipTokens.empty()) return false;
+    if (!pl || !pl->m_player1 || pl->m_player1->m_isDead) return false; // a real pending respawn
+    m_skipTokens.erase(m_skipTokens.begin());
+    return true;
+}
+
+float Pathfinder::timeMultiplier(PlayLayer* pl) const {
+    if (!m_fastForward || !pl || !active(pl) || !settingBool("fast-forward")) return 1.f;
+    if (!pl->m_player1 || pl->m_player1->m_isDead) return 1.f;
+    auto v = Mod::get()->getSettingValue<double>("fast-forward-speed");
+    return static_cast<float>(std::clamp(v, 1.0, 50.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -354,16 +459,58 @@ void Pathfinder::buildIndex(PlayLayer* pl) {
     std::sort(m_index.begin(), m_index.end(), [](WorldObject const& a, WorldObject const& b) { return a.minX < b.minX; });
 }
 
+void Pathfinder::refreshLive(PlayLayer* pl, uint64_t tick) {
+    // The game keeps every object in a grid of sections and moves objects
+    // between sections as move triggers push them around; its collision
+    // code reads the active sections every tick. Reading the same lists
+    // gives the real, current positions of moving blocks and hazards.
+    if (tick == m_liveTick) return;
+    m_liveTick = tick;
+    m_live.clear();
+    m_liveSet.clear();
+    auto& secs = pl->m_sections;
+    auto& sizes = pl->m_sectionSizes;
+    int l = std::max(0, pl->m_leftSectionIndex);
+    int r = pl->m_rightSectionIndex;
+    int b = std::max(0, pl->m_bottomSectionIndex);
+    int t = pl->m_topSectionIndex;
+    if (r < l || t < b || r - l > 400 || t - b > 400) return;
+    for (int i = l; i <= r && i < static_cast<int>(secs.size()) && i < static_cast<int>(sizes.size()); i++) {
+        auto col = secs[i];
+        auto colSizes = sizes[i];
+        if (!col || !colSizes) continue;
+        for (int j = b; j <= t && j < static_cast<int>(col->size()) && j < static_cast<int>(colSizes->size()); j++) {
+            auto sec = (*col)[j];
+            if (!sec) continue;
+            int n = std::min((*colSizes)[j], static_cast<int>(sec->size()));
+            for (int k = 0; k < n; k++) {
+                GameObject* obj = (*sec)[k];
+                if (!obj) continue;
+                auto kind = classify(obj->m_objectType);
+                if (!kind) continue;
+                if ((*kind == ObjKind::Solid || *kind == ObjKind::Hazard) && obj->m_isNoTouch) continue;
+                if (!m_liveSet.insert(obj).second) continue;
+                auto const& rc = obj->getObjectRect();
+                m_live.push_back({rc.getMinX(), rc.getMaxX(), obj, *kind});
+            }
+        }
+    }
+}
+
 void Pathfinder::queryWindow(float x0, float x1, std::vector<WorldObject const*>& out) const {
     out.clear();
+    for (auto const& w : m_live) {
+        if (w.minX <= x1 && w.maxX >= x0) out.push_back(&w);
+    }
+    // Beyond what the game currently simulates: the level's layout.
     float from = x0 - m_maxWidth - 1.f;
     auto it = std::lower_bound(m_index.begin(), m_index.end(), from,
                                [](WorldObject const& w, float v) { return w.minX < v; });
     for (; it != m_index.end() && it->minX <= x1; ++it) {
-        if (it->maxX >= x0) out.push_back(&*it);
+        if (it->maxX >= x0 && !m_liveSet.count(it->obj)) out.push_back(&*it);
     }
     for (auto const& w : m_wide) {
-        if (w.minX <= x1 && w.maxX >= x0) out.push_back(&w);
+        if (w.minX <= x1 && w.maxX >= x0 && !m_liveSet.count(w.obj)) out.push_back(&w);
     }
 }
 
@@ -621,7 +768,7 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
     uint64_t since = tick - m_lastToggle[ch];
     if (since < static_cast<uint64_t>(floorT)) {
         // Hold/release floor. Only an about-to-crash prediction on a spot
-        // that already failed >15 times may go down to a micro toggle.
+        // that already failed a lot may go down to a micro toggle.
         bool emergency = py < c.yMin - 2.f || py > c.yMax + 2.f;
         if (!(emergency && m_human.microAllowed(fails) && since >= static_cast<uint64_t>(m_human.microTicks()))) {
             return std::nullopt;
@@ -631,8 +778,7 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
     bool safe = py > c.yMin + band * 0.5f && py < c.yMax - band * 0.5f;
     int jitter = m_human.toggleJitter(safe);
     if (*want && isTap) {
-        int tapLen = floorT;
-        if (m_human.spec().jitterVariance > 0) tapLen += static_cast<int>(Humanizer::hash01(tick * 7 + ch) * 4.f);
+        int tapLen = std::max(floorT, Humanizer::tapLength(m_human.params(), tick * 7 + ch));
         m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + jitter + tapLen;
     }
     if (jitter > 0) {
@@ -646,8 +792,12 @@ std::optional<bool> Pathfinder::flyController(PlayLayer* pl, uint8_t ch, PlayerS
 std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, uint64_t tick) {
     int floorT = m_human.minStateTicks(spotFailures(tick));
     if (m_hold[ch]) {
-        // Default for ground modes is "nothing held": let go once the floor allows.
-        if (tick - m_lastToggle[ch] >= static_cast<uint64_t>(floorT)) return false;
+        // Default for ground modes is "nothing held": let go after a natural tap.
+        int len = std::max(floorT, m_assistHold[ch]);
+        if (tick - m_lastToggle[ch] >= static_cast<uint64_t>(len)) {
+            m_assistHold[ch] = 0;
+            return false;
+        }
         return std::nullopt;
     }
     if (!settingBool("reactive-assist")) return std::nullopt;
@@ -677,7 +827,7 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     auto key = reinterpret_cast<uintptr_t>(bestObj);
     if (m_assistJumpedFor == key) return std::nullopt;
     // Valid take-off window is roughly 8%-34% of a jump's length before the
-    // spike; aim for the 45-65% middle of that window, per-spike.
+    // spike; aim for the profile's preferred part of that window, per-spike.
     float frac = 0.08f + 0.26f * (0.45f + 0.20f * Humanizer::hash01(key)); // Mode 1: 45-65%
     switch (m_human.params().profile) {
         case Profile::Prodigy: frac = 0.08f + 0.26f * (0.35f + 0.20f * Humanizer::hash01(key)); break; // 35-55%
@@ -686,6 +836,7 @@ std::optional<bool> Pathfinder::groundAssist(PlayerSnap const& s, uint8_t ch, ui
     }
     if (best <= frac * span) {
         m_assistJumpedFor = key;
+        m_assistHold[ch] = Humanizer::tapLength(m_human.params(), tick * 13 + ch);
         return true;
     }
     return std::nullopt;
@@ -699,6 +850,7 @@ void Pathfinder::onTick(PlayLayer* pl) {
     if (!m_inLevel) return;
     if (!active(pl)) {
         if (m_hold[0] || m_hold[1]) releaseAll(pl);
+        m_fastForward = false;
         if (!m_enabled) m_status = "Off (F6 to start)";
         else if (!pl->m_isPracticeMode) m_status = "Enter Practice Mode to start";
         else if (pl->m_isPlatformer) m_status = "Platformer levels aren't supported";
@@ -707,15 +859,20 @@ void Pathfinder::onTick(PlayLayer* pl) {
     auto tick = static_cast<uint64_t>(pl->m_gameState.m_currentProgress);
     if (tick == m_lastTick) return;
     m_lastTick = tick;
+    m_tickCounter++;
     if (m_index.empty()) buildIndex(pl);
     if (m_segments.empty()) syncSegments(pl);
+    refreshLive(pl, tick);
 
     // Checkpoints placed or removed by hand mid-attempt.
     size_t cps = pl->m_checkpointArray ? pl->m_checkpointArray->count() : 0;
     if (cps + 1 > m_segments.size()) onCheckpointAdded(pl, tick, m_expectOurs);
     while (m_segments.size() > cps + 1) m_segments.pop_back();
 
-    if (!pl->m_player1 || pl->m_player1->m_isDead) return;
+    if (!pl->m_player1 || pl->m_player1->m_isDead) {
+        m_fastForward = false;
+        return;
+    }
 
     int nch = channels(pl);
     PlayerSnap s0;
@@ -733,6 +890,17 @@ void Pathfinder::onTick(PlayLayer* pl) {
         bool orb = touchingOrb(s);
 
         auto& sg = seg();
+
+        // Replays of a known prefix must reproduce the attempt they came
+        // from. If they don't, the level is random or something moved:
+        // remember that, so the next death isn't blamed on the candidate.
+        if (!m_divergedThisAttempt && sg.cluster && !sg.activePolish && tick < sg.cluster->windowStart &&
+            m_havePrevY[ch]) {
+            if (auto ref = sg.cluster->trace.at(ch, tick)) {
+                if (std::abs(ref->x - s.x) > 2.f || std::abs(ref->y - s.y) > 3.f) m_divergedThisAttempt = true;
+            }
+        }
+
         if (tick < sg.lockedUntil) {
             press(pl, ch, planStateAt(sg, ch, tick), tick, false);
         } else if (auto want = livePolicy(pl, ch, s, tick)) {
@@ -742,10 +910,8 @@ void Pathfinder::onTick(PlayLayer* pl) {
         auto& tr = m_trace.ticks[ch];
         if (tick >= m_trace.base) {
             auto idx = static_cast<size_t>(tick - m_trace.base);
-            TraceTick tt{s.x, s.y, s.vy, s.onGround, m_hold[ch], orb, s.mode};
-            if (idx > 200000) {
-                // absurdly long segment without a checkpoint; stop tracing
-            } else {
+            TraceTick tt{s.x, s.y, s.vy, s.onGround, m_hold[ch], orb, s.upsideDown, s.mode};
+            if (idx <= 200000) {
                 while (tr.size() < idx) tr.push_back(tr.empty() ? tt : tr.back());
                 if (tr.size() == idx) tr.push_back(tt);
             }
@@ -756,6 +922,21 @@ void Pathfinder::onTick(PlayLayer* pl) {
         if (ch == 0) s0 = s;
     }
     if (!s0.valid) return;
+
+    auto& sg = seg();
+
+    // Fast-forward through the part of this retry that is already solved.
+    {
+        uint64_t target = 0;
+        if (sg.cluster && !sg.noFastForward) target = std::min(sg.cluster->windowStart, sg.lockedUntil);
+        m_fastForward = tick + 40 < target;
+    }
+
+    // The spot being fixed was just cleared.
+    if (sg.cluster && !sg.cluster->resolvedNoted && tick > sg.cluster->deathTick + 12) {
+        notePolish(sg, *sg.cluster);
+        m_status = fmt::format("Cleared the {:.0f}% spot", pl->getCurrentPercent());
+    }
 
     // Just cleared a portal/orb/pad?
     if (m_prevX > 0.f && s0.x > m_prevX) {
@@ -775,11 +956,14 @@ void Pathfinder::onTick(PlayLayer* pl) {
                        tick - m_lastCheckpointTick >= 72;
         if ((timeUp || cleared) && safeForCheckpoint(pl, s0, tick)) m_pendingCheckpoint = true;
     }
+}
 
-    auto const& sg = seg();
-    if (sg.cluster && tick > sg.cluster->deathTick + 6 && tick < sg.cluster->deathTick + 10) {
-        m_status = fmt::format("Cleared the {:.0f}% spot", pl->getCurrentPercent());
+bool Pathfinder::isDoomedState(PlayerSnap const& s) const {
+    for (auto const& d : m_doomed) {
+        if (d.mode != s.mode || d.upsideDown != s.upsideDown) continue;
+        if (std::abs(d.x - s.x) < 40.f && std::abs(d.y - s.y) < 18.f && std::abs(d.vy - s.vy) < 2.5f) return true;
     }
+    return false;
 }
 
 bool Pathfinder::safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t tick) const {
@@ -788,6 +972,7 @@ bool Pathfinder::safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t 
     if (tick < sg.lockedUntil) return false;
     if (tick < sg.startTick + 60) return false;
     if (m_pendingToggleAt[0] >= 0 || m_tapReleaseAt[0] >= 0) return false;
+    if (sg.activePolish) return false; // don't freeze an untested change into a checkpoint
 
     std::vector<WorldObject const*> objs;
     auto checkPlayer = [&](PlayerSnap const& p, uint8_t ch) {
@@ -812,10 +997,11 @@ bool Pathfinder::safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t 
         return true;
     };
     if (!checkPlayer(s, 0)) return false;
+    if (isDoomedState(s)) return false; // a checkpoint here already turned out to be a dead end
     if (pl->m_gameState.m_isDualMode && pl->m_player2) {
         uint8_t ch2 = channels(pl) == 2 ? 1 : 0;
         PlayerSnap s2 = snap(pl->m_player2, ch2);
-        if (ch2 == 0) { s2.vy = 0; } // no separate history for p2 in single-channel dual
+        if (ch2 == 0) s2.vy = 0; // no separate history for p2 in single-channel dual
         if (!checkPlayer(s2, ch2)) return false;
     }
     if (sg.blacklist.count(planHash(sg.plan, tick))) return false;
@@ -827,13 +1013,19 @@ void Pathfinder::onPostUpdate(PlayLayer* pl) {
     m_pendingCheckpoint = false;
     if (!active(pl) || !pl->m_player1 || pl->m_player1->m_isDead) return;
     if (!pl->m_checkpointArray) return;
+
+    // Several ticks may have run since the spot was judged safe (high
+    // speedhack, fast-forward, low FPS): judge the state as it is now.
+    auto now = static_cast<uint64_t>(pl->m_gameState.m_currentProgress);
+    PlayerSnap s = snap(pl->m_player1, 0);
+    if (auto lt = m_trace.last(0)) s.vy = lt->vy;
+    if (!safeForCheckpoint(pl, s, now)) return; // try again on a later tick
+
     size_t before = pl->m_checkpointArray->count();
     m_expectOurs = true;
     pl->markCheckpoint();
     size_t after = pl->m_checkpointArray->count();
-    if (after > before && m_segments.size() < after + 1) {
-        onCheckpointAdded(pl, static_cast<uint64_t>(pl->m_gameState.m_currentProgress), true);
-    }
+    if (after > before && m_segments.size() < after + 1) onCheckpointAdded(pl, now, true);
     m_expectOurs = false;
 }
 
@@ -882,18 +1074,46 @@ uint64_t Pathfinder::candidateKey(std::vector<Event> const& base, Candidate cons
     return h;
 }
 
+void Pathfinder::describe(Candidate& c, uint64_t windowStart) const {
+    c.press = -1;
+    c.hold = 0;
+    for (auto const& e : c.events) {
+        if (e.tick < windowStart) continue;
+        if (e.hold && c.press < 0) {
+            c.press = static_cast<int64_t>(e.tick);
+        } else if (!e.hold && c.press >= 0 && c.hold == 0) {
+            c.hold = static_cast<int>(static_cast<int64_t>(e.tick) - c.press);
+        }
+    }
+}
+
+bool Pathfinder::respectsCooldown(std::vector<Event> const& base, std::vector<Event> const& cand, uint8_t ch) const {
+    int cd = profileSpec(m_profile).pressCooldown;
+    if (cd <= 0) return true;
+    std::vector<std::pair<uint64_t, bool>> presses; // tick, from candidate
+    for (auto const& e : base) if (e.ch == ch && e.hold) presses.push_back({e.tick, false});
+    for (auto const& e : cand) if (e.ch == ch && e.hold) presses.push_back({e.tick, true});
+    std::sort(presses.begin(), presses.end());
+    for (size_t i = 1; i < presses.size(); i++) {
+        if (!presses[i].second && !presses[i - 1].second) continue; // old inputs aren't re-judged
+        if (presses[i].first - presses[i - 1].first < static_cast<uint64_t>(cd)) return false;
+    }
+    return true;
+}
+
 void Pathfinder::rebuildBase(Segment& s, Cluster& c) {
+    (void)s;
     c.base.clear();
     for (auto const& e : c.attemptPlan) {
         if (e.tick < c.windowStart || e.ch != c.ch) c.base.push_back(e);
     }
-    (void)s;
 }
 
 void Pathfinder::openCluster(Segment& s, uint64_t deathTick, uint8_t ch, Mode mode, int side, bool doomed,
                              Trace const& trace, std::vector<Event> const& attemptPlan) {
     Cluster c;
     c.deathTick = deathTick;
+    c.bestDeath = deathTick;
     c.ch = ch;
     c.mode = mode;
     c.side = side;
@@ -920,6 +1140,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
     uint64_t ws = c.windowStart;
     uint64_t d = std::max(c.deathTick, ws + 2);
     int floorT = s.human.baseFloor;
+    bool unreal = s.human.profile == Profile::Unreal;
     bool holdAtWs = stateFrom(c.base, c.ch, ws, false);
     std::vector<Candidate> out;
     std::unordered_set<uint64_t> seen;
@@ -929,6 +1150,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         cand.key = candidateKey(c.base, cand);
         if (s.tried.count(cand.key) || seen.count(cand.key)) return;
         if (!cand.live && !respectsCooldown(c.base, cand.events, c.ch)) return;
+        describe(cand, ws);
         seen.insert(cand.key);
         out.push_back(std::move(cand));
     };
@@ -945,7 +1167,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         add(z);
     }
 
-    // Flying: first try steering the humanized controller differently.
+    // Flying: first try steering the corridor controller differently.
     if (isFlyMode(c.mode)) {
         int first = c.side > 0 ? -1 : 1; // killed by something above -> fly lower
         std::vector<std::pair<float, float>> tweaks = {{1.f, 1.f}, {0.6f, 1.f}, {1.f, 1.6f}, {0.6f, 1.6f}};
@@ -1018,7 +1240,7 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         uint64_t ideal = d > lead ? d - lead : ws;
         ideal = std::clamp(ideal, ws, d - 1);
         std::vector<uint64_t> ticks;
-        uint64_t step = s.human.profile == Profile::Unreal ? 1 : 2; // Mode 3 sweeps every tick
+        uint64_t step = unreal ? 1 : 2; // Mode 3 sweeps every tick
         for (uint64_t t = ws; t + 1 < d; t += step) ticks.push_back(t);
         std::stable_sort(ticks.begin(), ticks.end(), [&](uint64_t a, uint64_t b) {
             auto da = a > ideal ? a - ideal : ideal - a;
@@ -1028,30 +1250,37 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         for (size_t i = 0; i < ticks.size(); i++) anchors.push_back({ticks[i], groupBase + 40 + i * 1.0});
     }
 
-    std::vector<int> lengths;
-    if (s.human.profile == Profile::Unreal) {
-        // 1-tick swift releases first, then sustained holds.
-        switch (c.mode) {
-            case Mode::Cube: lengths = {1, 12, 44}; break;
-            case Mode::Robot: lengths = {1, 24, 34, 48}; break;
-            case Mode::Ship:
-            case Mode::Wave: lengths = {1, 8, 26, 44}; break;
-            default: lengths = {1, 8}; break;
+    // Hold lengths. Where the hold length doesn't change the physics (cube
+    // taps, ball/spider/UFO/swing clicks) the first length is a natural,
+    // varied tap instead of always the exact minimum.
+    auto lengthsFor = [&](uint64_t anchorTick) {
+        std::vector<int> lengths;
+        int tap = std::max(floorT, Humanizer::tapLength(s.human, anchorTick * 131 + c.deathTick));
+        if (unreal) {
+            switch (c.mode) {
+                case Mode::Cube: lengths = {1, 12, 44}; break;
+                case Mode::Robot: lengths = {1, 24, 34, 48}; break;
+                case Mode::Ship:
+                case Mode::Wave: lengths = {1, 8, 26, 44}; break;
+                default: lengths = {1, 8}; break;
+            }
+        } else {
+            switch (c.mode) {
+                case Mode::Cube: lengths = {tap, floorT + 12, 44}; break;
+                case Mode::Robot: lengths = {floorT, 24, 34, 48}; break;
+                case Mode::Ship:
+                case Mode::Wave: lengths = {floorT, 26, 44}; break;
+                default: lengths = {tap}; break;
+            }
         }
-    } else {
-        switch (c.mode) {
-            case Mode::Cube: lengths = {floorT, floorT + 12, 44}; break;
-            case Mode::Robot: lengths = {floorT, 24, 34, 48}; break;
-            case Mode::Ship:
-            case Mode::Wave: lengths = {floorT, 26, 44}; break;
-            default: lengths = {floorT}; break;
-        }
-    }
+        return lengths;
+    };
 
     std::unordered_set<uint64_t> usedTick;
     for (auto const& a : anchors) {
         if (holdAtWs && a.tick < ws + static_cast<uint64_t>(floorT)) continue;
         if (!usedTick.insert(a.tick).second) continue;
+        auto lengths = lengthsFor(a.tick);
         for (size_t li = 0; li < lengths.size(); li++) {
             Candidate cand;
             cand.events = withRelease({{a.tick, true, c.ch}, {a.tick + static_cast<uint64_t>(lengths[li]), false, c.ch}});
@@ -1067,54 +1296,68 @@ void Pathfinder::buildQueue(Segment& s, Cluster& c) {
         }
     }
 
-    std::stable_sort(out.begin(), out.end(), [](Candidate const& a, Candidate const& b) { return a.score < b.score; });
-
     // Anti-robot filter: push candidates whose resulting click rhythm is
     // machine-regular behind otherwise-equal ones. (Off in Mode 3: exact play.)
-    for (auto& cand : out) {
-        if (s.human.profile == Profile::Unreal) break;
-        std::vector<uint64_t> ticks;
-        for (auto const& e : c.base) if (e.ch == c.ch && e.tick + 400 >= ws) ticks.push_back(e.tick);
-        for (auto const& e : cand.events) ticks.push_back(e.tick);
-        std::sort(ticks.begin(), ticks.end());
-        cand.score += Humanizer::periodicity(ticks) * 25.0;
+    if (!unreal) {
+        for (auto& cand : out) {
+            std::vector<uint64_t> ticks;
+            for (auto const& e : c.base) if (e.ch == c.ch && e.tick + 400 >= ws) ticks.push_back(e.tick);
+            for (auto const& e : cand.events) ticks.push_back(e.tick);
+            std::sort(ticks.begin(), ticks.end());
+            cand.score += Humanizer::periodicity(ticks) * 25.0;
+        }
     }
     std::stable_sort(out.begin(), out.end(), [](Candidate const& a, Candidate const& b) { return a.score < b.score; });
 
     if (out.size() > 400) out.resize(400);
     c.queue = std::move(out);
     c.next = 0;
+    reprioritize(c);
 }
 
-void Pathfinder::addPairs(Segment& s, Cluster& c) {
+void Pathfinder::addPairs(Segment& s, Cluster& c, bool front) {
     c.pairsAdded = true;
     int floorT = s.human.baseFloor;
-    std::vector<Candidate> singles;
-    for (auto const& cand : c.queue) {
-        if (cand.live) continue;
-        int presses = 0;
-        for (auto const& e : cand.events) presses += e.hold ? 1 : 0;
-        if (presses == 1) singles.push_back(cand);
+    std::vector<Candidate const*> singles;
+    // Best-performing singles first (progress-guided), then queue order.
+    std::vector<Candidate> pool(c.queue.begin(), c.queue.end());
+    if (c.bestPress >= 0) {
+        std::stable_sort(pool.begin(), pool.end(), [&](Candidate const& a, Candidate const& b) {
+            auto da = a.press < 0 ? INT64_MAX : absDiff(a.press, c.bestPress);
+            auto db = b.press < 0 ? INT64_MAX : absDiff(b.press, c.bestPress);
+            return da < db;
+        });
+    }
+    for (auto const& cand : pool) {
+        if (cand.live || cand.press < 0) continue;
+        singles.push_back(&cand);
         if (singles.size() >= 10) break;
     }
     std::vector<Candidate> pairs;
     double sc = 500;
-    for (auto const& first : singles) {
+    for (auto const* first : singles) {
         uint64_t rel = 0;
-        for (auto const& e : first.events) if (!e.hold) rel = std::max(rel, e.tick);
+        for (auto const& e : first->events) if (!e.hold) rel = std::max(rel, e.tick);
         for (int gap : {floorT, floorT + 10, 28, 44}) {
             uint64_t t2 = rel + static_cast<uint64_t>(gap);
             if (t2 > c.deathTick + 10) continue;
-            Candidate p = first;
+            Candidate p = *first;
+            int tap = std::max(floorT, Humanizer::tapLength(s.human, t2 * 17 + c.deathTick));
+            if (s.human.profile == Profile::Unreal) tap = 1;
             p.events.push_back({t2, true, c.ch});
-            p.events.push_back({t2 + static_cast<uint64_t>(floorT), false, c.ch});
+            p.events.push_back({t2 + static_cast<uint64_t>(tap), false, c.ch});
             sortEvents(p.events);
             p.key = candidateKey(c.base, p);
             p.score = sc++;
+            describe(p, c.windowStart);
             if (!s.tried.count(p.key) && respectsCooldown(c.base, p.events, c.ch)) pairs.push_back(std::move(p));
         }
     }
-    c.queue.insert(c.queue.end(), pairs.begin(), pairs.end());
+    if (front) {
+        c.queue.insert(c.queue.begin() + static_cast<std::ptrdiff_t>(c.next), pairs.begin(), pairs.end());
+    } else {
+        c.queue.insert(c.queue.end(), pairs.begin(), pairs.end());
+    }
 }
 
 void Pathfinder::addMicro(Segment& s, Cluster& c) {
@@ -1134,7 +1377,7 @@ void Pathfinder::addMicro(Segment& s, Cluster& c) {
             if (!s.tried.count(lc.key)) extra.push_back(lc);
         }
     }
-    uint64_t ideal = d > 20 ? d - 20 : ws;
+    uint64_t ideal = c.bestPress >= 0 ? static_cast<uint64_t>(c.bestPress) : (d > 20 ? d - 20 : ws);
     for (int off = 0; off <= 30; off++) {
         for (int sign : {1, -1}) {
             if (off == 0 && sign < 0) continue;
@@ -1148,6 +1391,7 @@ void Pathfinder::addMicro(Segment& s, Cluster& c) {
                 cand.events = {{static_cast<uint64_t>(t), true, c.ch}, {static_cast<uint64_t>(t + micro), false, c.ch}};
             }
             cand.key = candidateKey(c.base, cand);
+            describe(cand, ws);
             if (!s.tried.count(cand.key) && respectsCooldown(c.base, cand.events, c.ch)) extra.push_back(std::move(cand));
         }
     }
@@ -1159,69 +1403,6 @@ void Pathfinder::addMicro(Segment& s, Cluster& c) {
         if (j < extra.size()) c.queue.push_back(std::move(extra[j++]));
         if (i < rest.size()) c.queue.push_back(std::move(rest[i++]));
     }
-}
-
-bool Pathfinder::applyNextCandidate(Segment& s) {
-    if (!s.cluster) return false;
-    auto& c = *s.cluster;
-    if (c.tries > 15 && !c.microAdded) addMicro(s, c);
-
-    for (int guard = 0; guard < 8; guard++) {
-        while (c.next < c.queue.size()) {
-            Candidate cand = c.queue[c.next++];
-            if (s.tried.count(cand.key)) continue;
-            s.tried.insert(cand.key);
-
-            c.curPress = -1;
-            c.curHold = 0;
-            for (auto const& e : cand.events) {
-                if (e.hold && c.curPress < 0) c.curPress = static_cast<int64_t>(e.tick);
-                else if (!e.hold && c.curPress >= 0 && c.curHold == 0) c.curHold = static_cast<int>(e.tick - static_cast<uint64_t>(c.curPress));
-            }
-            s.plan = c.base;
-            for (auto const& e : cand.events) s.plan.push_back(e);
-            sortEvents(s.plan);
-            if (cand.live) {
-                s.lockedUntil = c.windowStart;
-                s.flyOverride = FlyOverride{c.windowStart, c.deathTick + 90, c.ch, cand.fly};
-            } else {
-                uint64_t last = c.deathTick;
-                for (auto const& e : cand.events) last = std::max(last, e.tick);
-                s.lockedUntil = last + 1;
-                s.flyOverride.reset();
-            }
-            m_status = fmt::format("{} @ tick {}: try {} ({})", c.doomed ? "Re-routing" : "Fixing", c.deathTick,
-                                   c.tries + 1, cand.live ? "steer" : (cand.events.empty() ? "no input" : "clicks"));
-            return true;
-        }
-        if (!c.pairsAdded) { addPairs(s, c); continue; }
-        if (!c.microAdded) { addMicro(s, c); continue; }
-        if (c.widen < 2) {
-            c.widen++;
-            uint64_t L = lookback(c.mode) / 2;
-            c.windowStart = std::max(s.startTick, c.windowStart > L ? c.windowStart - L : 0);
-            rebuildBase(s, c);
-            c.pairsAdded = c.microAdded = false;
-            buildQueue(s, c);
-            continue;
-        }
-        break;
-    }
-    return false;
-}
-
-bool Pathfinder::respectsCooldown(std::vector<Event> const& base, std::vector<Event> const& cand, uint8_t ch) const {
-    int cd = profileSpec(m_profile).pressCooldown;
-    if (cd <= 0) return true;
-    std::vector<std::pair<uint64_t, bool>> presses; // tick, from candidate
-    for (auto const& e : base) if (e.ch == ch && e.hold) presses.push_back({e.tick, false});
-    for (auto const& e : cand) if (e.ch == ch && e.hold) presses.push_back({e.tick, true});
-    std::sort(presses.begin(), presses.end());
-    for (size_t i = 1; i < presses.size(); i++) {
-        if (!presses[i].second && !presses[i - 1].second) continue; // old inputs aren't re-judged
-        if (presses[i].first - presses[i - 1].first < static_cast<uint64_t>(cd)) return false;
-    }
-    return true;
 }
 
 void Pathfinder::addSweep(Segment& s, Cluster& c) {
@@ -1238,16 +1419,17 @@ void Pathfinder::addSweep(Segment& s, Cluster& c) {
         if (t < static_cast<int64_t>(ws) || t > static_cast<int64_t>(d) + 8) continue;
         auto tt = static_cast<uint64_t>(t);
         std::vector<std::vector<Event>> variants = {
-            {{tt, true, c.ch}, {tt + 1, false, c.ch}},                                       // 1-tick swift
-            {{tt, true, c.ch}, {tt + static_cast<uint64_t>(sustained), false, c.ch}},        // sustained hold
+            {{tt, true, c.ch}, {tt + 1, false, c.ch}},                                // 1-tick swift
+            {{tt, true, c.ch}, {tt + static_cast<uint64_t>(sustained), false, c.ch}}, // sustained hold
         };
-        if (holdAtWs) variants.push_back({{tt, false, c.ch}});                               // release here
+        if (holdAtWs) variants.push_back({{tt, false, c.ch}}); // release here
         for (auto& v : variants) {
             Candidate cand;
             if (holdAtWs && v.size() > 1) cand.events.push_back({ws, false, c.ch});
             for (auto const& e : v) cand.events.push_back(e);
             sortEvents(cand.events);
             cand.key = candidateKey(c.base, cand);
+            describe(cand, ws);
             if (s.tried.count(cand.key) || !respectsCooldown(c.base, cand.events, c.ch)) continue;
             sweep.push_back(std::move(cand));
         }
@@ -1256,9 +1438,156 @@ void Pathfinder::addSweep(Segment& s, Cluster& c) {
     m_status = fmt::format("Frame sweep around tick {} ({} tries)", anchor, sweep.size());
 }
 
+void Pathfinder::reprioritize(Cluster& c) {
+    // Progress-guided search: if some click got further than the original
+    // death, try the untested clicks closest to it next, on the side whose
+    // tested neighbour did better.
+    TryResult const* best = nullptr;
+    for (auto const& r : c.results) {
+        if (r.press < 0) continue;
+        if (!best || r.outcome > best->outcome) best = &r;
+    }
+    if (!best || best->outcome <= c.deathTick) return;
+    c.bestPress = best->press;
+    c.bestHold = best->hold;
+
+    uint64_t below = 0, above = 0; // outcome of the nearest tested neighbour on each side
+    int64_t nearBelow = INT64_MIN, nearAbove = INT64_MAX;
+    for (auto const& r : c.results) {
+        if (r.press < 0 || std::abs(r.hold - best->hold) > 2) continue;
+        if (r.press < best->press && r.press > nearBelow) { nearBelow = r.press; below = r.outcome; }
+        if (r.press > best->press && r.press < nearAbove) { nearAbove = r.press; above = r.outcome; }
+    }
+    if (nearBelow == INT64_MIN) below = best->outcome; // unexplored side: neutral
+    if (nearAbove == INT64_MAX) above = best->outcome;
+    int preferSide = above >= below ? 1 : -1;
+
+    std::vector<Candidate> nearList, farList;
+    for (size_t i = c.next; i < c.queue.size(); i++) {
+        auto& cand = c.queue[i];
+        if (!cand.live && cand.press >= 0 && absDiff(cand.press, best->press) <= 12) nearList.push_back(std::move(cand));
+        else farList.push_back(std::move(cand));
+    }
+    std::stable_sort(nearList.begin(), nearList.end(), [&](Candidate const& a, Candidate const& b) {
+        auto score = [&](Candidate const& x) {
+            double dist = static_cast<double>(absDiff(x.press, best->press));
+            double side = (x.press - best->press) * preferSide >= 0 ? 0.0 : 0.5;
+            double hold = std::abs(x.hold - best->hold) * 0.25;
+            return dist + side + hold;
+        };
+        return score(a) < score(b);
+    });
+    c.queue.resize(c.next);
+    for (auto& x : nearList) c.queue.push_back(std::move(x));
+    for (auto& x : farList) c.queue.push_back(std::move(x));
+}
+
+void Pathfinder::widenCluster(Segment& s, Cluster& c) {
+    c.widen++;
+    uint64_t L = lookback(c.mode) / 2;
+    c.windowStart = std::max(s.startTick, c.windowStart > L ? c.windowStart - L : 0);
+    rebuildBase(s, c);
+    c.pairsAdded = c.microAdded = c.sweepAdded = false;
+    buildQueue(s, c);
+}
+
+bool Pathfinder::escalate(PlayLayer* pl, Segment& s, Cluster& c) {
+    // Stuck detector: no progress for a while -> change approach now
+    // instead of grinding through the rest of the queue.
+    c.triesSinceImprove = 0;
+    c.escalation++;
+    if (c.escalation == 1 && !c.pairsAdded) {
+        addPairs(s, c, true);
+        m_status = "Stuck: trying two-click setups";
+        return false;
+    }
+    if (c.escalation <= 2 && c.widen < 2) {
+        widenCluster(s, c);
+        m_status = "Stuck: changing inputs further back";
+        return false;
+    }
+    // Dying close to the checkpoint without progress: the checkpoint itself
+    // is the problem.
+    if (m_segments.size() > 1 && c.deathTick < s.startTick + 2 * lookback(c.mode)) {
+        backtrack(pl);
+        return true;
+    }
+    if (c.widen < 2) widenCluster(s, c);
+    return false;
+}
+
+void Pathfinder::applyCandidate(Segment& s, Cluster& c, Candidate const& cand) {
+    c.current = cand;
+    c.hasCurrent = true;
+    s.plan = c.base;
+    for (auto const& e : cand.events) s.plan.push_back(e);
+    sortEvents(s.plan);
+    if (cand.live) {
+        s.lockedUntil = c.windowStart;
+        s.flyOverride = FlyOverride{c.windowStart, c.deathTick + 90, c.ch, cand.fly};
+    } else {
+        uint64_t last = c.deathTick;
+        for (auto const& e : cand.events) last = std::max(last, e.tick);
+        s.lockedUntil = last + 1;
+        s.flyOverride.reset();
+    }
+}
+
+bool Pathfinder::applyNextCandidate(Segment& s) {
+    if (!s.cluster) return false;
+    auto& c = *s.cluster;
+    if (c.tries > 15 && !c.microAdded) addMicro(s, c);
+
+    for (int guard = 0; guard < 8; guard++) {
+        while (c.next < c.queue.size()) {
+            Candidate cand = c.queue[c.next++];
+            if (s.tried.count(cand.key)) continue;
+            s.tried.insert(cand.key);
+            applyCandidate(s, c, cand);
+            m_status = fmt::format("{} @ tick {}: try {} ({})", c.doomed ? "Re-routing" : "Fixing", c.deathTick,
+                                   c.tries + 1, cand.live ? "steer" : (cand.events.empty() ? "no input" : "clicks"));
+            return true;
+        }
+        if (!c.pairsAdded) { addPairs(s, c, false); continue; }
+        if (!c.microAdded) { addMicro(s, c); continue; }
+        if (c.widen < 2) { widenCluster(s, c); continue; }
+        break;
+    }
+    return false;
+}
+
+void Pathfinder::restartStuck(Segment& s) {
+    // Nothing left to try and nowhere to backtrack to: start this spot over
+    // with a much wider window and setups first, so the next round isn't a
+    // repeat of the last one.
+    if (!s.cluster) return;
+    auto c = *s.cluster;
+    s.rootRounds++;
+    s.failures = 0;
+    s.tried.clear();
+    openCluster(s, c.deathTick, c.ch, c.mode, c.side, c.doomed, c.trace, c.attemptPlan);
+    auto& nc = *s.cluster;
+    uint64_t L = lookback(nc.mode) * static_cast<uint64_t>(1 + std::min(s.rootRounds, 3));
+    nc.windowStart = std::max(s.startTick, nc.deathTick > L ? nc.deathTick - L : 0);
+    nc.widen = 2;
+    rebuildBase(s, nc);
+    buildQueue(s, nc);
+    addPairs(s, nc, true);
+    applyNextCandidate(s);
+    m_status = s.rootRounds >= 2
+                   ? fmt::format("Stuck at tick {} (round {}): try Mode 3 (F7) or a checkpoint earlier", nc.deathTick,
+                                 s.rootRounds + 1)
+                   : fmt::format("Retrying tick {} with a wider search", nc.deathTick);
+}
+
 void Pathfinder::backtrack(PlayLayer* pl) {
     for (int depth = 0; depth < 4 && m_segments.size() > 1; depth++) {
-        uint64_t childStart = m_segments.back().startTick;
+        auto& child = m_segments.back();
+        uint64_t childStart = child.startTick;
+        if (child.hasStartState) {
+            auto const& st = child.startState;
+            m_doomed.push_back({st.x, st.y, st.vy, st.mode, st.upsideDown});
+        }
         size_t before = pl->m_checkpointArray ? pl->m_checkpointArray->count() : 0;
         pl->removeCheckpoint(false); // false = the most recent one
         size_t after = pl->m_checkpointArray ? pl->m_checkpointArray->count() : 0;
@@ -1270,6 +1599,8 @@ void Pathfinder::backtrack(PlayLayer* pl) {
         auto& parent = seg();
         parent.blacklist.insert(planHash(parent.plan, childStart));
         parent.failures++;
+        parent.activePolish.reset();
+        parent.pendingPolish.reset();
         Mode mode = Mode::Cube;
         if (auto tt = parent.lastTrace.at(0, childStart > 0 ? childStart - 1 : 0)) mode = tt->mode;
         openCluster(parent, childStart, 0, mode, 0, true, parent.lastTrace, parent.plan);
@@ -1277,21 +1608,114 @@ void Pathfinder::backtrack(PlayLayer* pl) {
         m_status = fmt::format("Backtracked: checkpoint {} was a dead end", m_segments.size());
         if (parent.failures <= maxFailures() && applyNextCandidate(parent)) return;
     }
-    // Back at the first segment with nothing left: start the search over with a clean slate.
-    auto& root = seg();
-    root.failures = 0;
-    root.tried.clear();
-    if (root.cluster) {
-        auto c = *root.cluster;
-        openCluster(root, c.deathTick, c.ch, c.mode, c.side, c.doomed, c.trace, c.attemptPlan);
-        applyNextCandidate(root);
-    }
+    if (m_segments.size() == 1) restartStuck(seg());
 }
+
+// ---------------------------------------------------------------------------
+// polish pass: move solved clicks to a natural spot inside their window
+// ---------------------------------------------------------------------------
+
+void Pathfinder::notePolish(Segment& s, Cluster& c) {
+    c.resolvedNoted = true;
+    if (!settingBool("polish-pass")) return;
+    if (!profileSpec(s.human.profile).centered) return; // Mode 3: exact timing
+    if (!c.hasCurrent || c.current.live || c.current.press < 0 || c.current.hold <= 0) return;
+    auto tw = static_cast<uint64_t>(c.current.press);
+    int hold = c.current.hold;
+
+    // The window this click works in, from the clicks that didn't.
+    int64_t lo = -1, hi = -1;
+    for (auto const& r : c.results) {
+        if (r.press < 0 || std::abs(r.hold - hold) > 2) continue;
+        if (r.press < static_cast<int64_t>(tw)) lo = std::max(lo, r.press);
+        if (r.press > static_cast<int64_t>(tw)) hi = hi < 0 ? r.press : std::min(hi, r.press);
+    }
+    uint64_t wlo = lo >= 0 ? static_cast<uint64_t>(lo + 1) : (tw > 3 ? tw - 3 : 0);
+    uint64_t whi = hi >= 0 ? static_cast<uint64_t>(hi - 1) : tw + 3;
+    wlo = std::max(wlo, c.windowStart);
+    if (whi <= wlo) return;
+    uint64_t alt = Humanizer::humanSpot(s.human, wlo, whi, tw * 31 + 7);
+    if (alt > whi || alt == tw) return;
+    s.pendingPolish = PolishItem{tw, alt, hold, c.ch, c.deathTick};
+}
+
+bool Pathfinder::movePress(std::vector<Event>& events, uint8_t ch, uint64_t from, uint64_t to, int hold, int floorT,
+                           bool check) const {
+    auto pressIt = std::find_if(events.begin(), events.end(),
+                                [&](Event const& e) { return e.ch == ch && e.hold && e.tick == from; });
+    if (pressIt == events.end()) return false;
+    uint64_t relFrom = from + static_cast<uint64_t>(hold);
+    auto relIt = std::find_if(events.begin(), events.end(),
+                              [&](Event const& e) { return e.ch == ch && !e.hold && e.tick == relFrom; });
+    if (relIt == events.end()) return false;
+    uint64_t relTo = to + static_cast<uint64_t>(hold);
+    if (check) {
+        int cd = profileSpec(m_profile).pressCooldown;
+        for (auto const& e : events) {
+            if (e.ch != ch || &e == &*pressIt || &e == &*relIt) continue;
+            if (e.tick < from) {
+                if (e.tick + static_cast<uint64_t>(floorT) > to) return false;
+                if (e.hold && cd > 0 && e.tick + static_cast<uint64_t>(cd) > to) return false;
+            } else {
+                if (relTo + static_cast<uint64_t>(floorT) > e.tick) return false;
+                if (e.hold && cd > 0 && to + static_cast<uint64_t>(cd) > e.tick) return false;
+            }
+        }
+    }
+    pressIt->tick = to;
+    relIt->tick = relTo;
+    sortEvents(events);
+    return true;
+}
+
+void Pathfinder::startPolish(Segment& s) {
+    if (!s.pendingPolish || s.activePolish || !s.cluster) return;
+    auto p = *s.pendingPolish;
+    auto& c = *s.cluster;
+    // Only clicks that are settled, well before the spot being fixed now.
+    uint64_t lastTick = std::max(p.orig, p.alt) + static_cast<uint64_t>(p.hold) + 20;
+    if (lastTick >= c.windowStart) return; // keep it pending for a later spot
+    s.pendingPolish.reset();
+    int floorT = s.human.baseFloor;
+    if (!movePress(s.plan, p.ch, p.orig, p.alt, p.hold, floorT, true)) return;
+    movePress(c.base, p.ch, p.orig, p.alt, p.hold, floorT, false);
+    movePress(c.attemptPlan, p.ch, p.orig, p.alt, p.hold, floorT, false);
+    s.activePolish = p;
+}
+
+bool Pathfinder::resolvePolish(Segment& s, uint64_t deathTick) {
+    if (!s.activePolish) return false;
+    auto p = *s.activePolish;
+    s.activePolish.reset();
+    if (deathTick > p.ref + 6) {
+        // Survived the polished spot: keep it. The cluster's reference trace
+        // is from before the change, so refresh it.
+        if (s.cluster) s.cluster->trace = m_trace;
+        return false;
+    }
+    // Died at (or before) the spot the click got us past: put it back.
+    int floorT = s.human.baseFloor;
+    movePress(s.plan, p.ch, p.alt, p.orig, p.hold, floorT, false);
+    if (s.cluster) {
+        movePress(s.cluster->base, p.ch, p.alt, p.orig, p.hold, floorT, false);
+        movePress(s.cluster->attemptPlan, p.ch, p.alt, p.orig, p.hold, floorT, false);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// deaths
+// ---------------------------------------------------------------------------
 
 void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer) {
     if (!m_inLevel || !active(pl) || m_deathHandled) return;
     m_deathHandled = true;
     m_totalDeaths++;
+    m_fastForward = false;
+    if (settingBool("instant-respawn") && !m_fastRespawnBroken) {
+        m_respawnPending = true;
+        m_respawnFrames = 0;
+    }
     if (m_segments.empty()) syncSegments(pl);
 
     auto tick = static_cast<uint64_t>(pl->m_gameState.m_currentProgress);
@@ -1301,6 +1725,13 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     m_pendingCheckpoint = false;
 
     auto& s = seg();
+
+    // A natural-timing nudge being tested caused this: undo it, rerun.
+    if (resolvePolish(s, tick)) {
+        m_status = "Natural timing didn't hold here; kept the exact one";
+        return;
+    }
+
     s.failures++;
 
     int side = 0;
@@ -1312,12 +1743,27 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     Mode mode = ps.mode;
     if (auto tt = m_trace.at(ch, tick > 3 ? tick - 3 : 0)) mode = tt->mode;
 
+    // The replay of the known part didn't match last time: the level is
+    // random or our view of it was off. Retry the same candidate instead of
+    // blaming it.
+    if (m_divergedThisAttempt && s.cluster && s.cluster->hasCurrent) {
+        s.divergences++;
+        if (s.divergences >= 3) s.noFastForward = true;
+        if (s.divergences <= 8) {
+            s.failures--;
+            applyCandidate(s, *s.cluster, s.cluster->current);
+            m_status = "Replay drifted (random/moving part): retrying the same inputs";
+            return;
+        }
+    }
+
     if (s.failures > maxFailures()) {
         if (m_segments.size() > 1) {
             backtrack(pl);
             return;
         }
-        s.failures = 0; // the very first segment can't be abandoned
+        restartStuck(s);
+        return;
     }
 
     if (s.cluster) {
@@ -1326,29 +1772,42 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
         bool worseInWindow = tick < c.deathTick && tick >= c.windowStart;
         if (sameSpot || worseInWindow) {
             c.tries++;
-            if (tick > c.bestDeath && c.curPress >= 0) {
+            if (c.hasCurrent) c.results.push_back({c.current.press, c.current.hold, tick});
+            if (tick > c.bestDeath) {
                 c.bestDeath = tick;
-                c.bestPress = c.curPress;
-                c.bestHold = c.curHold;
+                c.triesSinceImprove = 0;
+                if (c.hasCurrent && c.current.press >= 0) {
+                    c.bestPress = c.current.press;
+                    c.bestHold = c.current.hold;
+                }
+            } else {
+                c.triesSinceImprove++;
             }
             if (std::abs(ps.x - c.deathX) <= 5.f) c.nearCrashes++;
+            reprioritize(c);
             // Mode 3: stuck on the same obstacle >10 times -> exact frame sweep.
             if (profileSpec(m_profile).frameSweep && c.nearCrashes > 10 && !c.sweepAdded) addSweep(s, c);
+            int stuckLimit = profileSpec(m_profile).frameSweep ? 16 : 10;
+            if (c.triesSinceImprove >= stuckLimit) {
+                if (escalate(pl, s, c)) return; // backtracked
+            }
             if (!applyNextCandidate(s)) {
                 if (m_segments.size() > 1) backtrack(pl);
-                else {
-                    s.tried.clear();
-                    openCluster(s, c.deathTick, c.ch, c.mode, c.side, false, c.trace, c.attemptPlan);
-                    applyNextCandidate(s);
-                }
+                else restartStuck(s);
             }
             return;
         }
+        if (!c.resolvedNoted && tick > c.deathTick + 6) notePolish(s, c);
     }
     openCluster(s, tick, ch, mode, side, false, m_trace, s.plan);
     s.cluster->deathX = ps.x;
     s.cluster->nearCrashes = 1;
-    if (!applyNextCandidate(s) && m_segments.size() > 1) backtrack(pl);
+    if (!applyNextCandidate(s)) {
+        if (m_segments.size() > 1) backtrack(pl);
+        else restartStuck(s);
+        return;
+    }
+    startPolish(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,7 +1819,10 @@ std::string Pathfinder::hudText(PlayLayer* pl) const {
     int segFails = m_segments.empty() ? 0 : m_segments.back().failures;
     std::string line = fmt::format("[Pathfinder: {} (F6) | Mode: {} (F7) | CPs: {} | Attempts: {}/{}]",
                                    m_enabled ? "ON" : "OFF", profileLabel(m_profile), cps, segFails, maxFailures());
-    if (!m_status.empty()) line += "\n" + m_status;
+    std::string status = m_status;
+    if (m_fastForward) status += status.empty() ? ">> fast-forward" : "  >>";
+    if (m_fastRespawnBroken) status += " (instant respawn off)";
+    if (!status.empty()) line += "\n" + status;
     return line;
 }
 

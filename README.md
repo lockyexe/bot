@@ -34,6 +34,19 @@ Your own clicks are ignored while it's on (setting), so they don't end up in the
 All timings are physics ticks (240/s of game time), so it behaves the same at 1.0x or any speedhack.
 F6/F7 are read by virtual-key code, so they work on Turkish Q/F and any other layout.
 
+## Speed & accuracy features (v1.2)
+
+- **Instant respawn**: skips the game's respawn delay (auto-disables if your setup doesn't support it).
+- **Fast-forward**: the solved part of a retry runs at 8x (setting) on top of your speedhack; it slows down 40 ticks before the spot being fixed.
+- **Live objects**: reads the game's own collision sections every tick, so moving blocks and hazards are where they really are.
+- **Progress-guided search**: tries clicks next to whichever try got furthest, on the side that did better.
+- **Stuck detector**: 10 tries without progress → two-click setups → change inputs further back → backtrack.
+- **Dead-end memory**: the exact player state at a dead checkpoint is remembered; no new checkpoint is placed in that state.
+- **Replay drift check**: if a replay of known inputs doesn't reproduce, the death isn't blamed on the candidate.
+- **Checkpoint recheck**: safety is re-checked at the exact moment the checkpoint is placed.
+- **Natural taps**: tap lengths vary like real clicks (Mode 1 ~50-90 ms, Mode 2 ~25-55 ms).
+- **Polish pass**: a found click is moved to a natural spot inside its working window; kept only if the run survives.
+
 ## How it works
 
 | Piece | What it does |

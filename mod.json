@@ -5,7 +5,7 @@
 	},
 	"id": "lockyexe.practice-pathfinder",
 	"name": "Practice Pathfinder",
-	"version": "v1.1.0",
+	"version": "v1.2.0",
 	"developer": "lockyexe",
 	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases",
 	"tags": [
@@ -53,6 +53,38 @@
 			"type": "bool",
 			"name": "Show status label",
 			"description": "Show the small status label in the top-right corner of the level.",
+			"default": true
+		},
+		"instant-respawn": {
+			"type": "bool",
+			"name": "Instant respawn",
+			"description": "Respawn right after a death instead of waiting for the game's respawn delay. Turns itself off if your setup doesn't support it.",
+			"default": true
+		},
+		"fast-forward": {
+			"type": "bool",
+			"name": "Fast-forward solved parts",
+			"description": "On a retry, run the part that's already solved at high speed and slow down just before the spot being fixed. Inputs still land on the exact same ticks, so recordings are unaffected.",
+			"default": true
+		},
+		"fast-forward-speed": {
+			"type": "float",
+			"name": "Fast-forward speed",
+			"description": "How much faster the solved part of a retry runs (on top of your own speedhack). Your PC sets the real limit.",
+			"default": 8.0,
+			"min": 2.0,
+			"max": 30.0,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"arrow-step": 1.0,
+				"slider-step": 1.0
+			}
+		},
+		"polish-pass": {
+			"type": "bool",
+			"name": "Natural timing polish",
+			"description": "After a click is found, try moving it to a more natural spot inside the window it works in. Kept only if the run still survives. (Modes 1 and 2.)",
 			"default": true
 		}
 	}

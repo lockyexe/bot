@@ -10,8 +10,10 @@
 //   GJBaseGameLayer::handleButton     drop your own clicks while solving
 //   PlayLayer::destroyPlayer          deaths drive the search
 //   PlayLayer::resetLevel             every respawn starts a new attempt
+//   PlayLayer::delayedResetLevel      instant respawn (skip the game's stale timer)
 //   PlayLayer::postUpdate             auto-checkpoints + status label
-//   CCScheduler::update               F6 on/off, F7 mode cycle (any keyboard layout)
+//   CCScheduler::update               F6 on/off, F7 mode cycle (any keyboard layout),
+//                                     fast-forward through solved parts, instant respawn
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -104,6 +106,13 @@ class $modify(PathfinderPlayLayer, PlayLayer) {
         solver().onReset(this);
     }
 
+    void delayedResetLevel() {
+        // Our instant respawn already brought the player back; this is the
+        // game's original respawn timer arriving late.
+        if (solver().shouldSkipDelayedReset(this)) return;
+        PlayLayer::delayedResetLevel();
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         PlayLayer::destroyPlayer(player, object);
         // Ignore the game's start-of-level anticheat call and noclip (player survives).
@@ -146,7 +155,13 @@ bool keyPressedEdge(int vk, bool& wasDown, bool focused) {
 
 class $modify(PathfinderScheduler, CCScheduler) {
     void update(float dt) {
-        CCScheduler::update(dt);
+        // Fast-forward: the already-solved part of a retry runs at a higher
+        // game speed. Physics still steps at 240 ticks/s of game time, so
+        // every input lands on the same tick as at 1x.
+        float mult = 1.f;
+        if (auto pl = PlayLayer::get()) mult = solver().timeMultiplier(pl);
+        CCScheduler::update(dt * mult);
+        if (auto pl = PlayLayer::get()) solver().onFrame(pl);
 #ifdef GEODE_IS_WINDOWS
         static bool f6Down = false;
         static bool f7Down = false;
