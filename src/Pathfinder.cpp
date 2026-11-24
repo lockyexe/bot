@@ -698,9 +698,36 @@ void Pathfinder::press(PlayLayer* pl, uint8_t ch, bool down, uint64_t tick, bool
     if (pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode && GameManager::get()->getGameVariable("0010")) {
         isPlayer1 = !isPlayer1; // "flip 2-player controls"
     }
+    // GD 2.208x doesn't apply handleButton right away: it queues the click
+    // with a real-time timestamp and applies it at whichever physics step
+    // that time maps to. With several steps per frame (high FPS, speedhack,
+    // fast-forward) the same planned click lands a different number of
+    // ticks late every attempt, so retries aren't really the same inputs.
+    // Keep the handleButton call (that's what macro recorders capture),
+    // then take the click back out of the queue and give it to the player
+    // directly, so it always takes effect on the very next tick.
+    size_t queuedBefore = pl->m_queuedButtons.size();
     m_sending = true;
     pl->handleButton(down, 1, isPlayer1);
     m_sending = false;
+    if (settingBool("exact-inputs") && pl->m_queuedButtons.size() == queuedBefore + 1) {
+        auto cmd = pl->m_queuedButtons.back();
+        if (cmd.m_button == PlayerButton::Jump && cmd.m_isPush == down) {
+            pl->m_queuedButtons.pop_back();
+            auto apply = [&](PlayerObject* p) {
+                if (!p) return;
+                if (down) p->pushButton(PlayerButton::Jump);
+                else p->releaseButton(PlayerButton::Jump);
+            };
+            bool twoPlayer = pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode;
+            if (twoPlayer) {
+                apply(cmd.m_isPlayer2 ? pl->m_player2 : pl->m_player1);
+            } else {
+                apply(pl->m_player1);
+                if (pl->m_gameState.m_isDualMode) apply(pl->m_player2);
+            }
+        }
+    }
     m_hold[ch] = down;
     m_lastToggle[ch] = tick;
     if (down) m_lastPress[ch] = static_cast<int64_t>(tick);
