@@ -68,6 +68,8 @@ struct TraceTick {
     Mode mode = Mode::Cube;
     bool mini = false;
     float w = 30.f, h = 30.f;
+    int orbType = -1; // GameObjectType of the orb being touched (-1: none)
+    int padType = -1; // GameObjectType of the pad being touched (-1: none)
 };
 
 struct Trace {
@@ -237,6 +239,7 @@ private:
     PlayerSnap snap(PlayerObject* p, uint8_t ch) const;
     Corridor corridor(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, float lookahead) const;
     bool touchingOrb(PlayerSnap const& s) const;
+    int touchingType(PlayerSnap const& s, ObjKind kind) const;
     bool solidContact(PlayerSnap const& s) const;
     void updateBounds(uint8_t ch, PlayerSnap const& s);
 

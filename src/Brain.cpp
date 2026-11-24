@@ -111,6 +111,46 @@ float PhysicsModel::vmaxUp(Mode m, bool mini) const { return std::max(0.5f, m_vU
 float PhysicsModel::vmaxDown(Mode m, bool mini) const { return std::min(-0.5f, m_vDown[mi(m)][mini ? 1 : 0].value); }
 float PhysicsModel::waveSlope(bool mini) const { return std::max(0.2f, m_wave[mini ? 1 : 0].value); }
 
+bool PhysicsModel::flipsGravity(int type) {
+    return type == static_cast<int>(GameObjectType::GravityRing) || type == static_cast<int>(GameObjectType::GreenRing) ||
+           type == static_cast<int>(GameObjectType::GravityPad);
+}
+
+bool PhysicsModel::unsupported(int type) {
+    return type == static_cast<int>(GameObjectType::CustomRing) || type == static_cast<int>(GameObjectType::DashRing) ||
+           type == static_cast<int>(GameObjectType::GravityDashRing) || type == static_cast<int>(GameObjectType::SpiderOrb) ||
+           type == static_cast<int>(GameObjectType::SpiderPad) || type == static_cast<int>(GameObjectType::TeleportOrb);
+}
+
+SpecialEffect PhysicsModel::special(int type, Mode m, bool mini) const {
+    SpecialEffect e;
+    if (type < 0 || type >= 48 || unsupported(type)) return e;
+    auto const& st = m_special[type][mi(m)][mini ? 1 : 0];
+    if (st.n == 0) return e; // never seen this one used: don't guess
+    e.known = true;
+    e.flip = flipsGravity(type);
+    e.vyRel = st.value;
+    return e;
+}
+
+void PhysicsModel::observeSpecial(int type, Mode m, bool mini, float vyRelAfter) {
+    if (type < 0 || type >= 48 || unsupported(type)) return;
+    auto& st = m_special[type][mi(m)][mini ? 1 : 0];
+    if (st.n == 0) {
+        st.value = vyRelAfter;
+        st.n = 1;
+    } else {
+        st.add(vyRelAfter, 0.25f);
+    }
+    m_samples++;
+}
+
+int PhysicsModel::learnedSpecials() const {
+    int n = 0;
+    for (auto const& a : m_special) for (auto const& b : a) for (auto const& c : b) n += c.n > 0 ? 1 : 0;
+    return n;
+}
+
 void PhysicsModel::noteAccuracy(bool ok) {
     m_accN++;
     float a = std::max(0.05f, 1.f / static_cast<float>(m_accN));
@@ -119,20 +159,21 @@ void PhysicsModel::noteAccuracy(bool ok) {
 
 std::string PhysicsModel::serialize() const {
     std::ostringstream o;
-    o << "v1";
+    o << "v2";
     auto put = [&](Stat const& s) { o << ' ' << s.value << ' ' << std::min(s.n, 50); };
     for (auto& a : m_accel) for (auto& b : a) for (auto& c : b) for (auto& d : c) put(d);
     for (auto& a : m_impulse) for (auto& b : a) put(b);
     for (auto& a : m_vUp) for (auto& b : a) put(b);
     for (auto& a : m_vDown) for (auto& b : a) put(b);
     for (auto& a : m_wave) put(a);
+    for (auto& a : m_special) for (auto& b : a) for (auto& c : b) put(c);
     return o.str();
 }
 
 void PhysicsModel::deserialize(std::string const& str) {
     std::istringstream in(str);
     std::string tag;
-    if (!(in >> tag) || tag != "v1") return;
+    if (!(in >> tag) || (tag != "v1" && tag != "v2")) return;
     PhysicsModel tmp;
     auto get = [&](Stat& s) {
         float v = 0;
@@ -148,6 +189,10 @@ void PhysicsModel::deserialize(std::string const& str) {
     for (auto& a : tmp.m_vUp) for (auto& b : a) if (!get(b)) return;
     for (auto& a : tmp.m_vDown) for (auto& b : a) if (!get(b)) return;
     for (auto& a : tmp.m_wave) if (!get(a)) return;
+    if (tag == "v2") {
+        for (auto& a : tmp.m_special) for (auto& b : a) for (auto& c : b) if (!get(c)) return;
+        std::copy(&tmp.m_special[0][0][0], &tmp.m_special[0][0][0] + 48 * 8 * 2, &m_special[0][0][0]);
+    }
     // Only take it if the whole record parsed.
     std::copy(&tmp.m_accel[0][0][0][0], &tmp.m_accel[0][0][0][0] + 8 * 2 * 2 * 2, &m_accel[0][0][0][0]);
     std::copy(&tmp.m_impulse[0][0], &tmp.m_impulse[0][0] + 8 * 2, &m_impulse[0][0]);
@@ -169,6 +214,24 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
     float maxW = 0;
     for (auto const& o : w.objs) maxW = std::max(maxW, o.r.size.width);
     size_t start = 0;
+    std::vector<uint8_t> used(w.objs.size(), 0);
+    bool afterModeChange = false;
+    auto finishDeath = [&]() {
+        // After a mode change the learned numbers for the new mode may be
+        // thin: don't let the bot act on such a prediction.
+        if (afterModeChange) res.uncertain = true;
+        else res.died = true;
+    };
+    // Known speed portal speeds (units per second): 0.5x, 1x, 2x, 3x, 4x.
+    static constexpr float SPEEDS[5] = {251.16f, 311.58f, 387.42f, 468.0f, 576.0f};
+    auto speedScale = [&](float vx) {
+        // Calibrate table speeds to how this game measures them per tick.
+        float perSec = vx * 240.f;
+        float best = SPEEDS[1];
+        for (float sp : SPEEDS) if (std::abs(sp - perSec) < std::abs(best - perSec)) best = sp;
+        return vx / (best / 240.f);
+    };
+    float scale = s.vx > 0.f ? speedScale(s.vx) : 1.f;
 
     auto supportAt = [&](float x0, float x1, float edgeY, bool below, size_t from) {
         // Is there a surface touching edgeY (within 2 units) under/over [x0, x1]?
@@ -282,12 +345,84 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
             if (o.r.getMinX() > pr.getMaxX()) break;
             if (!o.r.intersectsRect(pr)) continue;
             if (o.kind == ObjKind::Hazard) {
-                res.died = true;
+                finishDeath();
                 return res;
             }
-            if (o.kind == ObjKind::Orb && !hold) continue; // passing an orb without clicking does nothing
+            if (o.kind == ObjKind::Speed) {
+                if (!used[k] && o.speed > 0.f) {
+                    used[k] = 1;
+                    s.vx = o.speed * scale;
+                }
+                continue;
+            }
+            if (o.kind == ObjKind::Orb || o.kind == ObjKind::Pad) {
+                // Orbs fire while the button is held (a click or a held
+                // button touching it); pads fire on touch.
+                if (used[k] || (o.kind == ObjKind::Orb && !hold)) continue;
+                auto eff = m.special(o.type, s.mode, s.mini);
+                if (!eff.known) {
+                    res.uncertain = true;
+                    return res;
+                }
+                used[k] = 1;
+                if (eff.flip) {
+                    s.upside = !s.upside;
+                    g = -g;
+                }
+                s.vy = eff.vyRel * g;
+                s.grounded = false;
+                continue;
+            }
+            if (o.kind == ObjKind::Portal) {
+                if (used[k]) continue;
+                used[k] = 1;
+                using T = GameObjectType;
+                auto t = static_cast<T>(o.type);
+                auto setMode = [&](Mode nm) {
+                    if (s.mode != nm) {
+                        s.mode = nm;
+                        s.vy *= 0.5f;
+                        afterModeChange = true;
+                        both = s.mode != Mode::Cube && s.mode != Mode::Robot;
+                    }
+                };
+                switch (t) {
+                    case T::InverseGravityPortal:
+                        if (!s.upside) { s.upside = true; g = -1.f; s.grounded = false; }
+                        break;
+                    case T::NormalGravityPortal:
+                        if (s.upside) { s.upside = false; g = 1.f; s.grounded = false; }
+                        break;
+                    case T::GravityTogglePortal:
+                        s.upside = !s.upside;
+                        g = -g;
+                        s.grounded = false;
+                        break;
+                    case T::MiniSizePortal:
+                        if (!s.mini) { s.mini = true; s.w *= 0.6f; s.h *= 0.6f; half = s.h * 0.5f; }
+                        break;
+                    case T::RegularSizePortal:
+                        if (s.mini) { s.mini = false; s.w /= 0.6f; s.h /= 0.6f; half = s.h * 0.5f; }
+                        break;
+                    case T::ShipPortal: setMode(Mode::Ship); break;
+                    case T::CubePortal: setMode(Mode::Cube); break;
+                    case T::BallPortal: setMode(Mode::Ball); break;
+                    case T::UfoPortal: setMode(Mode::Ufo); break;
+                    case T::WavePortal: setMode(Mode::Wave); break;
+                    case T::RobotPortal: setMode(Mode::Robot); break;
+                    case T::SpiderPortal: setMode(Mode::Spider); break;
+                    case T::SwingPortal: setMode(Mode::Swing); break;
+                    case T::InverseMirrorPortal:
+                    case T::NormalMirrorPortal:
+                        break; // visual only
+                    default:
+                        res.uncertain = true; // dual / solo / teleport portals
+                        return res;
+                }
+                continue;
+            }
             if (o.kind != ObjKind::Solid || o.slope) {
-                res.uncertain = true; // orb click / pad / portal / slope: not modelled
+                res.uncertain = true; // slopes aren't modelled
                 return res;
             }
             float prevBottom = prevY - half;
@@ -298,7 +433,7 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
             if (fromAbove) {
                 bool floorHit = g > 0.f;
                 if (!floorHit && !both) {
-                    res.died = true;
+                    finishDeath();
                     return res;
                 }
                 s.y = o.r.getMaxY() + half;
@@ -307,14 +442,14 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
             } else if (fromBelow) {
                 bool floorHit = g < 0.f;
                 if (!floorHit && !both) {
-                    res.died = true;
+                    finishDeath();
                     return res;
                 }
                 s.y = o.r.getMinY() - half;
                 s.vy = 0.f;
                 s.grounded = floorHit;
             } else {
-                res.died = true; // ran into the side of a block
+                finishDeath(); // ran into the side of a block
                 return res;
             }
             pr = cocos2d::CCRect(s.x - s.w * 0.5f, s.y - half, s.w, s.h);
@@ -327,7 +462,7 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
         }
         if (s.y + half > w.ceilY) {
             if (!both && g > 0.f) {
-                res.died = true;
+                finishDeath();
                 return res;
             }
             s.y = w.ceilY - half;

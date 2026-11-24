@@ -9,6 +9,6 @@ char const* modeName(Mode m);
 bool isFlyMode(Mode m);     // ship, UFO, wave, swing
 bool isBoundedMode(Mode m); // modes that get a floor + ceiling (flying modes, ball, spider)
 
-enum class ObjKind : uint8_t { Solid, Hazard, Orb, Pad, Portal };
+enum class ObjKind : uint8_t { Solid, Hazard, Orb, Pad, Portal, Speed };
 
 } // namespace pf

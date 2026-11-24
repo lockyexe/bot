@@ -46,7 +46,14 @@ ahead against the real hitboxes:
   corridor controller when it predicts a crash.
 - **After a death**: every candidate fix is simulated; predicted passes are tried first. The brain is only trusted
   at a spot if it reproduces the death that actually happened there. The label shows how often it does (`Brain 87%`).
-- Orbs, pads, portals and slopes aren't simulated; there it falls back to the search.
+- **Orbs and pads**: the first time an orb or pad type is used in a mode, the brain learns what it does and
+  simulates it from then on (orbs fire when clicked/held while touching, pads on touch).
+- **Portals**: gravity, size, mode and speed portals are simulated. Dash/teleport/spider orbs, dual and teleport
+  portals and slopes aren't; there it falls back to the search.
+- **Flying planner**: when the controller's move would crash, it finds every moment in the next ~0.1 s where
+  switching survives and switches at a natural spot in that window.
+- **Early presses**: it plans in the air too, so it presses slightly before landing (held into the landing)
+  like a real player instead of on the exact landing tick.
 
 ## Speed & accuracy features (v1.2)
 

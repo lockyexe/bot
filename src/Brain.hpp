@@ -10,9 +10,12 @@
 //
 // Simulator rolls the player forward tick by tick under a given input
 // pattern against the real hitboxes ahead (hazards kill, blocks are landed
-// on or slid along depending on the mode, side hits kill). Orbs, pads,
-// portals and slopes are not modelled: reaching one ends the rollout as
-// "uncertain" so the bot never acts on a guess about them.
+// on or slid along depending on the mode, side hits kill). Orbs and pads
+// use effects learned from watching them being used (until one is learned,
+// reaching it ends the rollout as "uncertain"). Gravity, size, mode and speed
+// portals are applied; deaths after a mode change count as uncertain.
+// Dash/teleport/spider orbs, dual/teleport portals and slopes are not
+// modelled and end the rollout as uncertain.
 //
 // Everything is in physics ticks (240 per second of game time).
 
@@ -30,6 +33,15 @@ struct SimObj {
     cocos2d::CCRect r;
     ObjKind kind = ObjKind::Solid;
     bool slope = false;
+    int type = -1;     // GameObjectType value (orbs, pads, portals)
+    float speed = 0.f; // speed portals: new horizontal speed, units per tick at that speed
+};
+
+// What touching/clicking an orb or pad does, gravity-relative after any flip.
+struct SpecialEffect {
+    bool known = false;
+    bool flip = false;
+    float vyRel = 0.f;
 };
 
 struct SimWorld {
@@ -73,6 +85,13 @@ public:
     float vmaxDown(Mode m, bool mini) const; // negative
     float waveSlope(bool mini) const;        // |vy| / vx
 
+    // Orbs and pads, learned per object type, mode and size.
+    SpecialEffect special(int type, Mode m, bool mini) const;
+    void observeSpecial(int type, Mode m, bool mini, float vyRelAfter);
+    static bool flipsGravity(int type);
+    static bool unsupported(int type);
+    int learnedSpecials() const;
+
     void noteAccuracy(bool ok);
     float accuracy() const { return m_accuracy; }
     int accuracySamples() const { return m_accN; }
@@ -94,7 +113,7 @@ private:
     Stat m_vUp[8][2];
     Stat m_vDown[8][2];
     Stat m_wave[2];
-    bool m_impulseTaken[2] = {false, false};
+    Stat m_special[48][8][2];
     float m_accuracy = 0.f;
     int m_accN = 0;
     int m_samples = 0;

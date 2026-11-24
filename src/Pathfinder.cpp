@@ -78,6 +78,23 @@ std::optional<ObjKind> classify(GameObjectType t) {
     }
 }
 
+// Speed portals by object ID -> units per second (0.5x, 1x, 2x, 3x, 4x).
+float speedPortalSpeed(int id) {
+    switch (id) {
+        case 200: return 251.16f;
+        case 201: return 311.58f;
+        case 202: return 387.42f;
+        case 203: return 468.0f;
+        case 1334: return 576.0f;
+        default: return 0.f;
+    }
+}
+
+std::optional<ObjKind> classifyObj(GameObject* o) {
+    if (speedPortalSpeed(o->m_objectID) > 0.f) return ObjKind::Speed;
+    return classify(o->m_objectType);
+}
+
 bool stateFrom(std::vector<Event> const& events, uint8_t ch, uint64_t tick, bool startHold) {
     bool h = startHold;
     for (auto const& e : events) {
@@ -459,7 +476,7 @@ void Pathfinder::buildIndex(PlayLayer* pl) {
     m_index.reserve(pl->m_objects->count() / 2);
     for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
         if (!obj) continue;
-        auto kind = classify(obj->m_objectType);
+        auto kind = classifyObj(obj);
         if (!kind) continue;
         if ((*kind == ObjKind::Solid || *kind == ObjKind::Hazard) && obj->m_isNoTouch) continue;
         auto const& r = obj->getObjectRect();
@@ -502,7 +519,7 @@ void Pathfinder::refreshLive(PlayLayer* pl, uint64_t tick) {
             for (int k = 0; k < n; k++) {
                 GameObject* obj = (*sec)[k];
                 if (!obj) continue;
-                auto kind = classify(obj->m_objectType);
+                auto kind = classifyObj(obj);
                 if (!kind) continue;
                 if ((*kind == ObjKind::Solid || *kind == ObjKind::Hazard) && obj->m_isNoTouch) continue;
                 if (!m_liveSet.insert(obj).second) continue;
@@ -570,6 +587,16 @@ bool Pathfinder::touchingOrb(PlayerSnap const& s) const {
         if (w->obj->getObjectRect().intersectsRect(s.rect)) return true;
     }
     return false;
+}
+
+int Pathfinder::touchingType(PlayerSnap const& s, ObjKind kind) const {
+    std::vector<WorldObject const*> objs;
+    queryWindow(s.rect.getMinX() - 5.f, s.rect.getMaxX() + 5.f, objs);
+    for (auto w : objs) {
+        if (w->kind != kind) continue;
+        if (w->obj->getObjectRect().intersectsRect(s.rect)) return static_cast<int>(w->obj->m_objectType);
+    }
+    return -1;
 }
 
 bool Pathfinder::solidContact(PlayerSnap const& s) const {
@@ -905,7 +932,9 @@ void Pathfinder::onTick(PlayLayer* pl) {
             float a = std::clamp(m_human.vyDamping(), 0.05f, 1.f);
             m_vySmooth[ch] = (a >= 1.f) ? s.vy : m_vySmooth[ch] + (s.vy - m_vySmooth[ch]) * a;
         }
-        bool orb = touchingOrb(s);
+        int orbType = touchingType(s, ObjKind::Orb);
+        int padType = touchingType(s, ObjKind::Pad);
+        bool orb = orbType >= 0;
 
         auto& sg = seg();
 
@@ -928,8 +957,22 @@ void Pathfinder::onTick(PlayLayer* pl) {
         // Learn the game's physics from what just happened.
         if (m_havePrevY[ch] && tick > 0) {
             if (auto prev = m_trace.at(ch, tick - 1)) {
+                // Orb clicked / pad touched: learn what it does in this mode.
+                if (prev->mode == s.mode && prev->mini == s.mini) {
+                    float gNow = s.upsideDown ? -1.f : 1.f;
+                    float gPrev = prev->upsideDown ? -1.f : 1.f;
+                    float va = s.vy * gNow;
+                    float vb = prev->vy * gPrev;
+                    bool flipped = prev->upsideDown != s.upsideDown;
+                    bool kicked = flipped || std::abs(va - vb) > 0.5f;
+                    if (kicked && prev->orbType >= 0 && prev->hold) {
+                        m_model.observeSpecial(prev->orbType, s.mode, s.mini, va);
+                    } else if (kicked && prev->padType >= 0) {
+                        m_model.observeSpecial(prev->padType, s.mode, s.mini, va);
+                    }
+                }
                 if (prev->mode == s.mode && prev->mini == s.mini && prev->upsideDown == s.upsideDown &&
-                    !prev->touchingOrb && !orb) {
+                    !prev->touchingOrb && !orb && prev->padType < 0 && padType < 0) {
                     int64_t since = static_cast<int64_t>(tick) - m_lastPress[ch];
                     int tsp = since > 1000 ? 1000 : static_cast<int>(since);
                     m_model.observe(s.mode, s.mini, s.upsideDown, prev->hold, prev->onGround, s.onGround, prev->vy,
@@ -953,6 +996,8 @@ void Pathfinder::onTick(PlayLayer* pl) {
             tt.mini = s.mini;
             tt.w = s.rect.size.width;
             tt.h = s.rect.size.height;
+            tt.orbType = orbType;
+            tt.padType = padType;
             if (idx <= 200000) {
                 while (tr.size() < idx) tr.push_back(tr.empty() ? tt : tr.back());
                 if (tr.size() == idx) tr.push_back(tt);
@@ -1885,6 +1930,8 @@ SimWorld Pathfinder::simWorld(uint8_t ch, SimState const& st, float range) const
         so.r = o->obj->getObjectRect();
         so.kind = o->kind;
         so.slope = o->obj->m_objectType == GameObjectType::Slope;
+        so.type = static_cast<int>(o->obj->m_objectType);
+        so.speed = speedPortalSpeed(o->obj->m_objectID) / 240.f;
         w.objs.push_back(so);
     }
     std::sort(w.objs.begin(), w.objs.end(), [](SimObj const& a, SimObj const& b) { return a.r.getMinX() < b.r.getMinX(); });
@@ -1922,8 +1969,10 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
         }
         return std::nullopt;
     }
-    // Cube, robot, ball and spider act from the ground only.
-    if (!s.onGround || s.vx <= 0.3f) {
+    // Planning also runs in the air: a press just before landing (held
+    // into the landing) or a click on an orb ahead is decided by the
+    // simulation, like a player pressing slightly early.
+    if (s.vx <= 0.3f) {
         plan = {};
         return std::nullopt;
     }
@@ -1992,6 +2041,10 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
 
 std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick,
                                          std::optional<bool> want) {
+    // Flying planner: if what the corridor controller wants is predicted
+    // to crash, find every moment within the next ~0.1 s where switching
+    // survives and switch at a natural spot inside that window (or keep
+    // going if not switching is what survives).
     (void)pl;
     if (!brainOn() || s.vx <= 0.3f) return want;
     if (m_pendingToggleAt[ch] >= 0 || m_tapReleaseAt[ch] >= 0) return want;
@@ -2004,39 +2057,70 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
     int tapLen = std::max(floorT, Humanizer::tapLength(m_human.params(), tick * 7 + ch));
     bool cur = m_hold[ch];
     SimState st = toSim(s, cur);
-    SimWorld w = simWorld(ch, st, st.vx * 50.f + 60.f);
-    constexpr int H = 36;
+    int H = s.mode == Mode::Wave ? 40 : 52;
+    SimWorld w = simWorld(ch, st, st.vx * static_cast<float>(H + 10) + 60.f);
 
-    auto fnFor = [&](bool toggleNow) -> InputFn {
-        if (tapMode) {
-            if (toggleNow) return [tapLen](int i) { return i < tapLen; };
-            return [](int) { return false; };
-        }
-        bool v = toggleNow ? !cur : cur;
-        return [v](int) { return v; };
+    // Input pattern: switch at `at` (and back at `back`), -1 = never.
+    auto pattern = [&](int at, int back) -> InputFn {
+        if (tapMode) return [at, tapLen](int i) { return at >= 0 && i >= at && i < at + tapLen; };
+        return [cur, at, back](int i) {
+            bool v = cur;
+            if (at >= 0 && i >= at) v = !v;
+            if (back >= 0 && i >= back) v = !v;
+            return v;
+        };
     };
-    bool aToggles = tapMode ? (want.has_value() && *want) : (want.has_value() && *want != cur);
-    auto ra = Simulator::run(m_model, st, w, fnFor(aToggles), H);
-    if (!ra.died) return want; // the controller's choice looks safe
-    auto rb = Simulator::run(m_model, st, w, fnFor(!aToggles), H);
-    if (rb.died && rb.ticks <= ra.ticks + 6) return want; // switching doesn't help either
+    auto run = [&](InputFn const& fn) { return Simulator::run(m_model, st, w, fn, H); };
 
-    if (!aToggles) {
-        // The brain says: toggle now.
-        uint64_t sinceT = tick - m_lastToggle[ch];
-        bool floorOk = sinceT >= static_cast<uint64_t>(floorT) ||
-                       (m_human.microAllowed(fails) && sinceT >= static_cast<uint64_t>(m_human.microTicks()));
-        if (!floorOk) return want;
-        bool pressing = tapMode || !cur;
-        int cd = m_human.pressCooldown();
-        if (pressing && cd > 0 && static_cast<int64_t>(tick) - m_lastPress[ch] < cd) return want;
-        if (tapMode) {
-            m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + tapLen;
-            return true;
-        }
-        return !cur;
+    bool aToggles = tapMode ? (want.has_value() && *want) : (want.has_value() && *want != cur);
+    auto ra = run(pattern(aToggles ? 0 : -1, -1));
+    if (!ra.died) return want; // the controller's choice looks safe
+    if (aToggles && !run(pattern(-1, -1)).died) return std::nullopt; // just don't switch yet
+
+    // Earliest tick a switch is allowed (hold/release floor, 15 CPS cap).
+    uint64_t sinceT = tick - m_lastToggle[ch];
+    int earliest = sinceT >= static_cast<uint64_t>(floorT) ? 0 : static_cast<int>(floorT - sinceT);
+    if (m_human.microAllowed(fails) && sinceT >= static_cast<uint64_t>(m_human.microTicks())) earliest = 0;
+    int cd = m_human.pressCooldown();
+    bool switchPresses = tapMode || !cur;
+    if (switchPresses && cd > 0) {
+        earliest = std::max<int>(earliest, static_cast<int>(std::max<int64_t>(0, m_lastPress[ch] + cd - static_cast<int64_t>(tick))));
     }
-    // The brain says: don't do the toggle the controller wanted.
+
+    std::vector<int> ok;
+    int bestK = -1, bestTicks = ra.ticks;
+    for (int k = earliest; k <= 24; k++) {
+        auto r = run(pattern(k, -1));
+        if (!r.died) ok.push_back(k);
+        else if (r.ticks > bestTicks) { bestTicks = r.ticks; bestK = k; }
+    }
+    if (ok.empty() && !tapMode) {
+        // Tight spot: switch and switch back.
+        for (int k = earliest; k <= earliest + 8 && ok.empty(); k += 2) {
+            for (int back : {k + floorT, k + floorT + 6, k + floorT + 12}) {
+                if (!run(pattern(k, back)).died) { ok.push_back(k); break; }
+            }
+        }
+    }
+    if (ok.empty()) {
+        if (bestK >= 0 && bestTicks > ra.ticks + 6) ok.push_back(bestK); // best effort
+        else return want;
+    }
+    int lo = ok.front(), hi = lo;
+    while (std::find(ok.begin(), ok.end(), hi + 1) != ok.end()) hi++;
+    auto spot = Humanizer::humanSpot(m_human.params(), tick + static_cast<uint64_t>(lo), tick + static_cast<uint64_t>(hi),
+                                     (tick + static_cast<uint64_t>(hi)) * 5 + ch);
+    if (spot > tick + static_cast<uint64_t>(hi)) spot = tick + static_cast<uint64_t>(lo + (hi - lo) / 2);
+    int k = static_cast<int>(spot - tick);
+
+    bool to = tapMode ? true : !cur;
+    if (k <= 0) {
+        if (tapMode) m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + tapLen;
+        return to;
+    }
+    m_pendingToggleAt[ch] = static_cast<int64_t>(tick) + k;
+    m_pendingToggleTo[ch] = to;
+    if (tapMode) m_tapReleaseAt[ch] = static_cast<int64_t>(tick) + k + tapLen;
     return std::nullopt;
 }
 
@@ -2120,7 +2204,8 @@ std::string Pathfinder::hudText(PlayLayer* pl) const {
     if (m_fastForward) status += status.empty() ? ">> fast-forward" : "  >>";
     if (m_fastRespawnBroken) status += " (instant respawn off)";
     if (brainOn() && m_model.accuracySamples() > 0) {
-        status += fmt::format("{}Brain {:.0f}%", status.empty() ? "" : " | ", m_model.accuracy() * 100.f);
+        status += fmt::format("{}Brain {:.0f}% ({} orbs/pads learned)", status.empty() ? "" : " | ",
+                              m_model.accuracy() * 100.f, m_model.learnedSpecials());
     }
     if (!status.empty()) line += "\n" + status;
     return line;
