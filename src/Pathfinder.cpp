@@ -1063,7 +1063,7 @@ void Pathfinder::onTick(PlayLayer* pl) {
         if (ch == 0) s0 = s;
     }
     if (!s0.valid) return;
-    if (m_pathPts.size() < 40000) m_pathPts.push_back({s0.x, s0.y});
+    if (m_pathPts.size() < 40000) m_pathPts.push_back(cocos2d::CCPoint(s0.x, s0.y));
     if (m_roomValid && m_roomTo.x < s0.x - 5.f) m_roomValid = false;
     // Player 2 in regular (one-input) dual: keep its speed for the brain.
     if (pl->m_gameState.m_isDualMode && nch == 1 && pl->m_player2) {
@@ -2358,8 +2358,8 @@ int Pathfinder::pressWait(uint8_t ch, uint64_t tick) const {
 
 void Pathfinder::setRoom(PlayerSnap const& s, uint64_t tick, int64_t lo, int64_t hi) {
     float vx = std::max(s.vx, 0.f);
-    m_roomFrom = {s.x + static_cast<float>(lo - static_cast<int64_t>(tick)) * vx, s.y};
-    m_roomTo = {s.x + static_cast<float>(hi - static_cast<int64_t>(tick)) * vx, s.y};
+    m_roomFrom = cocos2d::CCPoint(s.x + static_cast<float>(lo - static_cast<int64_t>(tick)) * vx, s.y);
+    m_roomTo = cocos2d::CCPoint(s.x + static_cast<float>(hi - static_cast<int64_t>(tick)) * vx, s.y);
     m_roomValid = true;
 }
 
