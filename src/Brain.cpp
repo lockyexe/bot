@@ -125,12 +125,50 @@ bool PhysicsModel::unsupported(int type) {
 SpecialEffect PhysicsModel::special(int type, Mode m, bool mini) const {
     SpecialEffect e;
     if (type < 0 || type >= 48 || unsupported(type)) return e;
-    auto const& st = m_special[type][mi(m)][mini ? 1 : 0];
-    if (st.n == 0) return e; // never seen this one used: don't guess
-    e.known = true;
     e.flip = flipsGravity(type);
-    e.vyRel = st.value;
+    auto const& st = m_special[type][mi(m)][mini ? 1 : 0];
+    if (st.n > 0) {
+        e.known = true;
+        e.vyRel = st.value;
+        return e;
+    }
+    // Never seen it used in this mode yet: educated guess relative to this
+    // mode's jump (or the cube's), flagged so a predicted death after it
+    // isn't trusted.
+    float imp = impulse(m, mini);
+    if (imp <= 0.5f) imp = impulse(Mode::Cube, mini);
+    using T = GameObjectType;
+    float f = 0.f;
+    switch (static_cast<T>(type)) {
+        case T::YellowJumpRing: f = 1.0f; break;
+        case T::PinkJumpRing: f = 0.72f; break;
+        case T::RedJumpRing: f = 1.38f; break;
+        case T::GravityRing: f = 0.4f; break;
+        case T::GreenRing: f = 1.0f; break;
+        case T::DropRing: f = -1.5f; break;
+        case T::YellowJumpPad: f = 1.45f; break;
+        case T::PinkJumpPad: f = 0.95f; break;
+        case T::RedJumpPad: f = 1.9f; break;
+        case T::GravityPad: f = 0.6f; break;
+        default: return e;
+    }
+    e.known = true;
+    e.prior = true;
+    e.vyRel = imp * f;
     return e;
+}
+
+void PhysicsModel::noteMiss(Mode m) {
+    m_misses[mi(m)]++;
+    m_margin[mi(m)] = std::min(5.f, m_margin[mi(m)] + 0.75f);
+}
+
+void PhysicsModel::noteHit(Mode m) { m_hits[mi(m)]++; }
+
+bool PhysicsModel::trusted(Mode m) const {
+    int h = m_hits[mi(m)], x = m_misses[mi(m)];
+    if (x < 6) return true;
+    return static_cast<float>(h + 2) / static_cast<float>(h + x + 2) >= 0.4f;
 }
 
 void PhysicsModel::observeSpecial(int type, Mode m, bool mini, float vyRelAfter) {
@@ -215,7 +253,8 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
     for (auto const& o : w.objs) maxW = std::max(maxW, o.r.size.width);
     size_t start = 0;
     std::vector<uint8_t> used(w.objs.size(), 0);
-    bool afterModeChange = false;
+    bool afterModeChange = false; // also set after a guessed orb/pad effect
+    float margin = m.hazardMargin(s.mode);
     auto finishDeath = [&]() {
         // After a mode change the learned numbers for the new mode may be
         // thin: don't let the bot act on such a prediction.
@@ -343,11 +382,16 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
         for (size_t k = start; k < w.objs.size(); k++) {
             auto const& o = w.objs[k];
             if (o.r.getMinX() > pr.getMaxX()) break;
-            if (!o.r.intersectsRect(pr)) continue;
             if (o.kind == ObjKind::Hazard) {
-                finishDeath();
-                return res;
+                cocos2d::CCRect hr(o.r.getMinX() - margin, o.r.getMinY() - margin, o.r.size.width + 2 * margin,
+                                   o.r.size.height + 2 * margin);
+                if (hr.intersectsRect(pr)) {
+                    finishDeath();
+                    return res;
+                }
+                continue;
             }
+            if (!o.r.intersectsRect(pr)) continue;
             if (o.kind == ObjKind::Speed) {
                 if (!used[k] && o.speed > 0.f) {
                     used[k] = 1;
@@ -365,6 +409,7 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
                     return res;
                 }
                 used[k] = 1;
+                if (eff.prior) afterModeChange = true;
                 if (eff.flip) {
                     s.upside = !s.upside;
                     g = -g;
@@ -384,6 +429,7 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
                         s.vy *= 0.5f;
                         afterModeChange = true;
                         both = s.mode != Mode::Cube && s.mode != Mode::Robot;
+                        margin = m.hazardMargin(s.mode);
                     }
                 };
                 switch (t) {
@@ -449,8 +495,14 @@ SimResult Simulator::run(PhysicsModel const& m, SimState s, SimWorld const& w, I
                 s.vy = 0.f;
                 s.grounded = floorHit;
             } else {
-                finishDeath(); // ran into the side of a block
-                return res;
+                // Blocks only kill through the player's small inner hitbox;
+                // grazing an edge with the outer box is survivable.
+                cocos2d::CCRect inner(s.x - s.w * 0.15f, s.y - s.h * 0.15f, s.w * 0.3f, s.h * 0.3f);
+                if (o.r.intersectsRect(inner)) {
+                    finishDeath(); // ran into the side of a block
+                    return res;
+                }
+                continue;
             }
             pr = cocos2d::CCRect(s.x - s.w * 0.5f, s.y - half, s.w, s.h);
         }

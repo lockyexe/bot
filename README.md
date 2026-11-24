@@ -52,6 +52,12 @@ ahead against the real hitboxes:
   portals and slopes aren't; there it falls back to the search.
 - **Flying planner**: when the controller's move would crash, it finds every moment in the next ~0.1 s where
   switching survives and switches at a natural spot in that window.
+- **Inner hitbox**: blocks only kill through the player's small inner hitbox, like in the game; edge grazes survive.
+- **Self-correcting**: a "safe" call that ends in a death adds a safety margin for that mode; a mode whose
+  predictions keep failing stops using the brain and falls back to the search.
+- **First-time orbs/pads**: an educated guess is used until it has seen one used (deaths after a guess don't count).
+- **Dual**: in one-input dual, every click is checked against both players.
+- **Checkpoints** aren't placed right before an obstacle that needs a click.
 - **Early presses**: it plans in the air too, so it presses slightly before landing (held into the landing)
   like a real player instead of on the exact landing tick.
 

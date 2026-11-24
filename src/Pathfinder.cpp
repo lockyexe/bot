@@ -383,6 +383,9 @@ void Pathfinder::onReset(PlayLayer* pl) {
         m_brainPlan[c] = {};
         m_lastGuardTick[c] = 0;
     }
+    m_pred = {};
+    m_pressHist.clear();
+    m_p2Prev = false;
     m_deathHandled = false;
     m_divergedThisAttempt = false;
     m_pendingCheckpoint = false;
@@ -701,6 +704,13 @@ void Pathfinder::press(PlayLayer* pl, uint8_t ch, bool down, uint64_t tick, bool
     m_hold[ch] = down;
     m_lastToggle[ch] = tick;
     if (down) m_lastPress[ch] = static_cast<int64_t>(tick);
+    if (ch == 0) {
+        m_pred.valid = false; // the "safe" prediction assumed no new input
+        if (down) {
+            m_pressHist.push_back(static_cast<int64_t>(tick));
+            if (m_pressHist.size() > 8) m_pressHist.erase(m_pressHist.begin());
+        }
+    }
     if (ch == 0) m_human.noteToggle(tick);
     if (record && !m_segments.empty()) seg().plan.push_back({tick, down, ch});
 }
@@ -1009,6 +1019,14 @@ void Pathfinder::onTick(PlayLayer* pl) {
         if (ch == 0) s0 = s;
     }
     if (!s0.valid) return;
+    // Player 2 in regular (one-input) dual: keep its speed for the brain.
+    if (pl->m_gameState.m_isDualMode && nch == 1 && pl->m_player2) {
+        m_p2PrevX = pl->m_player2->m_position.x;
+        m_p2PrevY = pl->m_player2->m_position.y;
+        m_p2Prev = true;
+    } else {
+        m_p2Prev = false;
+    }
 
     auto& sg = seg();
 
@@ -1084,7 +1102,14 @@ bool Pathfinder::safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t 
         return true;
     };
     if (!checkPlayer(s, 0)) return false;
-    if (isDoomedState(s)) return false; // a checkpoint here already turned out to be a dead end
+    if (isDoomedState(s)) return false;
+    // Not right before something that needs a click.
+    if (brainOn() && !isFlyMode(s.mode) && m_model.trusted(s.mode) && s.vx > 0.3f) {
+        SimState st = toSim(s, false);
+        SimWorld w = simWorld(0, st, st.vx * 60.f + 60.f);
+        InputFn none = [](int) { return false; };
+        if (Simulator::run(m_model, st, w, none, 45).died) return false;
+    } // a checkpoint here already turned out to be a dead end
     if (pl->m_gameState.m_isDualMode && pl->m_player2) {
         uint8_t ch2 = channels(pl) == 2 ? 1 : 0;
         PlayerSnap s2 = snap(pl->m_player2, ch2);
@@ -1106,6 +1131,10 @@ void Pathfinder::onPostUpdate(PlayLayer* pl) {
     auto now = static_cast<uint64_t>(pl->m_gameState.m_currentProgress);
     PlayerSnap s = snap(pl->m_player1, 0);
     if (auto lt = m_trace.last(0)) s.vy = lt->vy;
+    if (m_trace.ticks[0].size() >= 2) {
+        auto const& tr = m_trace.ticks[0];
+        s.vx = tr[tr.size() - 1].x - tr[tr.size() - 2].x;
+    }
     if (!safeForCheckpoint(pl, s, now)) return; // try again on a later tick
 
     size_t before = pl->m_checkpointArray->count();
@@ -1813,6 +1842,13 @@ void Pathfinder::onDeath(PlayLayer* pl, PlayerObject* player, GameObject* killer
     releaseAll(pl);
     m_pendingCheckpoint = false;
 
+    // The brain called this stretch safe and we died anyway: it was wrong
+    // here, so it gets more careful in this mode.
+    if (m_pred.valid && ch == 0 && tick >= m_pred.at && tick <= m_pred.until && tick - m_pred.at <= 90) {
+        m_model.noteMiss(m_pred.mode);
+    }
+    m_pred.valid = false;
+
     auto& s = seg();
 
     // A natural-timing nudge being tested caused this: undo it, rerun.
@@ -1957,6 +1993,31 @@ SimWorld Pathfinder::simWorld(uint8_t ch, SimState const& st, float range) const
     return w;
 }
 
+std::optional<SimState> Pathfinder::dualState(PlayLayer* pl) const {
+    if (!m_p2Prev || !pl->m_gameState.m_isDualMode || !pl->m_player2 || channels(pl) != 1) return std::nullopt;
+    PlayerSnap p = snap(pl->m_player2, 0);
+    if (!p.valid || p.dead) return std::nullopt;
+    p.vx = p.x - m_p2PrevX;
+    p.vy = p.y - m_p2PrevY;
+    if (p.vx <= 0.3f) return std::nullopt;
+    return toSim(p, false);
+}
+
+SimResult Pathfinder::simBoth(SimState const& st, std::optional<SimState> const& st2, SimWorld const& w,
+                              SimWorld const* w2, InputFn const& fn, int horizon) const {
+    auto r = Simulator::run(m_model, st, w, fn, horizon);
+    if (!st2 || !w2) return r;
+    auto r2 = Simulator::run(m_model, *st2, *w2, fn, horizon);
+    SimResult out;
+    out.died = r.died || r2.died;
+    out.uncertain = r.uncertain || r2.uncertain;
+    if (r.died && r2.died) out.ticks = std::min(r.ticks, r2.ticks);
+    else if (r.died) out.ticks = r.ticks;
+    else if (r2.died) out.ticks = r2.ticks;
+    else out.ticks = std::max(r.ticks, r2.ticks);
+    return out;
+}
+
 std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick) {
     (void)pl;
     int floorT = m_human.minStateTicks(spotFailures(tick));
@@ -1976,6 +2037,10 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
         plan = {};
         return std::nullopt;
     }
+    if (!m_model.trusted(s.mode)) {
+        plan = {};
+        return groundAssist(s, ch, tick); // the brain kept being wrong in this mode
+    }
 
     auto fire = [&]() -> std::optional<bool> {
         m_assistHold[ch] = std::max(floorT, plan.len);
@@ -1992,9 +2057,16 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
 
     SimState st = toSim(s, false);
     SimWorld w = simWorld(ch, st, st.vx * 140.f + 80.f);
+    auto st2 = ch == 0 ? dualState(pl) : std::nullopt;
+    std::optional<SimWorld> w2;
+    if (st2) w2 = simWorld(0, *st2, st2->vx * 140.f + 80.f);
+    auto runAll = [&](InputFn const& fn, int H) { return simBoth(st, st2, w, w2 ? &*w2 : nullptr, fn, H); };
     InputFn none = [](int) { return false; };
-    auto rNone = Simulator::run(m_model, st, w, none, 120);
-    if (!rNone.died) return std::nullopt; // doing nothing is safe: do nothing
+    auto rNone = runAll(none, 120);
+    if (!rNone.died) {
+        if (ch == 0 && !rNone.uncertain) m_pred = {tick, tick + 120, s.mode, true};
+        return std::nullopt; // doing nothing is safe: do nothing
+    }
 
     int since = static_cast<int>(tick - m_lastToggle[ch]);
     int64_t earliest = std::max(0, floorT - since);
@@ -2012,7 +2084,7 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
     for (int len : lens) {
         auto survives = [&](int k) {
             InputFn fn = [k, len](int i) { return i >= k && i < k + len; };
-            return !Simulator::run(m_model, st, w, fn, k + 110).died;
+            return !runAll(fn, k + 110).died;
         };
         int first = -1;
         for (int k = static_cast<int>(earliest); k <= K; k += 2) {
@@ -2032,6 +2104,14 @@ std::optional<bool> Pathfinder::brainGround(PlayLayer* pl, uint8_t ch, PlayerSna
                                          static_cast<uint64_t>(plan.hi) * 7 + ch * 3);
         if (spot > static_cast<uint64_t>(plan.hi)) spot = static_cast<uint64_t>(plan.lo + (plan.hi - plan.lo) / 2);
         plan.target = static_cast<int64_t>(spot);
+        // Don't repeat the exact same click interval twice in a row.
+        if (ch == 0 && m_pressHist.size() >= 2 && m_human.params().profile != Profile::Unreal) {
+            int64_t lastGap = m_pressHist.back() - m_pressHist[m_pressHist.size() - 2];
+            if (plan.target - m_pressHist.back() == lastGap) {
+                if (plan.target + 1 <= plan.hi) plan.target++;
+                else if (plan.target - 1 >= plan.lo) plan.target--;
+            }
+        }
         break;
     }
     if (plan.target < 0) return std::nullopt; // no click helps: let the search learn from it
@@ -2051,6 +2131,7 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
     if (!want && tick - m_lastGuardTick[ch] < 2) return want;
     m_lastGuardTick[ch] = tick;
 
+    if (!m_model.trusted(s.mode)) return want;
     bool tapMode = s.mode == Mode::Ufo || s.mode == Mode::Swing;
     int fails = spotFailures(tick);
     int floorT = m_human.minStateTicks(fails);
@@ -2059,6 +2140,10 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
     SimState st = toSim(s, cur);
     int H = s.mode == Mode::Wave ? 40 : 52;
     SimWorld w = simWorld(ch, st, st.vx * static_cast<float>(H + 10) + 60.f);
+    auto st2 = ch == 0 ? dualState(pl) : std::nullopt;
+    if (st2) st2->hold = cur;
+    std::optional<SimWorld> w2;
+    if (st2) w2 = simWorld(0, *st2, st2->vx * static_cast<float>(H + 10) + 60.f);
 
     // Input pattern: switch at `at` (and back at `back`), -1 = never.
     auto pattern = [&](int at, int back) -> InputFn {
@@ -2070,11 +2155,14 @@ std::optional<bool> Pathfinder::flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap c
             return v;
         };
     };
-    auto run = [&](InputFn const& fn) { return Simulator::run(m_model, st, w, fn, H); };
+    auto run = [&](InputFn const& fn) { return simBoth(st, st2, w, w2 ? &*w2 : nullptr, fn, H); };
 
     bool aToggles = tapMode ? (want.has_value() && *want) : (want.has_value() && *want != cur);
     auto ra = run(pattern(aToggles ? 0 : -1, -1));
-    if (!ra.died) return want; // the controller's choice looks safe
+    if (!ra.died) {
+        if (ch == 0 && !ra.uncertain && !aToggles) m_pred = {tick, tick + static_cast<uint64_t>(H), s.mode, true};
+        return want; // the controller's choice looks safe
+    }
     if (aToggles && !run(pattern(-1, -1)).died) return std::nullopt; // just don't switch yet
 
     // Earliest tick a switch is allowed (hold/release floor, 15 CPS cap).
@@ -2172,6 +2260,8 @@ void Pathfinder::rankWithBrain(Segment& s, Cluster& c) {
     uint64_t simDeath = ws + static_cast<uint64_t>(replay.ticks);
     bool agree = replay.died && absDiff(static_cast<int64_t>(simDeath), static_cast<int64_t>(d)) <= 12;
     m_model.noteAccuracy(agree);
+    if (agree) m_model.noteHit(st.mode);
+    else if (!replay.uncertain && (!replay.died || simDeath > d + 12)) m_model.noteMiss(st.mode); // too optimistic
     if (!agree) return;
 
     std::vector<Event> baseCh;

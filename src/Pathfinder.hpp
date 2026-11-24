@@ -299,6 +299,9 @@ private:
     std::optional<bool> flyGuard(PlayLayer* pl, uint8_t ch, PlayerSnap const& s, uint64_t tick, std::optional<bool> want);
     void rankWithBrain(Segment& s, Cluster& c);
     void saveModel();
+    std::optional<SimState> dualState(PlayLayer* pl) const;
+    SimResult simBoth(SimState const& st, std::optional<SimState> const& st2, SimWorld const& w, SimWorld const* w2,
+                      InputFn const& fn, int horizon) const;
 
     // Checkpoints
     bool safeForCheckpoint(PlayLayer* pl, PlayerSnap const& s, uint64_t tick) const;
@@ -371,6 +374,15 @@ private:
         uint64_t madeAt = 0;
     };
     BrainPlan m_brainPlan[2];
+    struct Prediction { // last "this is safe" call, to catch the brain being wrong
+        uint64_t at = 0, until = 0;
+        Mode mode = Mode::Cube;
+        bool valid = false;
+    };
+    Prediction m_pred;
+    std::vector<int64_t> m_pressHist; // recent press ticks (player 1), for the rhythm check
+    float m_p2PrevX = 0, m_p2PrevY = 0;
+    bool m_p2Prev = false;
     uint64_t m_lastGuardTick[2] = {0, 0};
 
     std::string m_status;

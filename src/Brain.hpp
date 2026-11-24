@@ -40,6 +40,7 @@ struct SimObj {
 // What touching/clicking an orb or pad does, gravity-relative after any flip.
 struct SpecialEffect {
     bool known = false;
+    bool prior = false; // an educated guess (never seen it used yet)
     bool flip = false;
     float vyRel = 0.f;
 };
@@ -92,6 +93,14 @@ public:
     static bool unsupported(int type);
     int learnedSpecials() const;
 
+    // Self-correction per mode: hazards get a safety margin that grows when
+    // a "safe" prediction ends in a death, and a mode whose predictions keep
+    // failing stops being trusted.
+    float hazardMargin(Mode m) const { return m_margin[mi(m)]; }
+    void noteMiss(Mode m);
+    void noteHit(Mode m);
+    bool trusted(Mode m) const;
+
     void noteAccuracy(bool ok);
     float accuracy() const { return m_accuracy; }
     int accuracySamples() const { return m_accN; }
@@ -114,6 +123,9 @@ private:
     Stat m_vDown[8][2];
     Stat m_wave[2];
     Stat m_special[48][8][2];
+    float m_margin[8] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    int m_hits[8] = {};
+    int m_misses[8] = {};
     float m_accuracy = 0.f;
     int m_accN = 0;
     int m_samples = 0;
