@@ -1,0 +1,39 @@
+name: Build Geode Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  build:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: given
+          use-lto: false
+
+      - name: Upload the .geode file
+        uses: actions/upload-artifact@v4
+        with:
+          name: Practice Pathfinder
+          path: ${{ steps.build.outputs.build-output }}
+
+      - name: Publish the .geode as a release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Practice Pathfinder (latest build)
+          files: ${{ steps.build.outputs.build-output }}/*.geode
+          make_latest: true
+
+permissions:
+  contents: write

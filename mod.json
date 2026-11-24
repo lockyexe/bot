@@ -1,0 +1,59 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "lockyexe.practice-pathfinder",
+	"name": "Practice Pathfinder",
+	"version": "v1.0.0",
+	"developer": "lockyexe",
+	"description": "Humanized Practice Mode auto-solver that feeds real clicks to your macro recorder for showcases",
+	"tags": [
+		"gameplay",
+		"utility"
+	],
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Start enabled",
+			"description": "Turn the solver on as soon as you enter a level. You can always toggle it mid-run with <cy>F6</c>. It only plays while you are in <cg>Practice Mode</c>.",
+			"default": false
+		},
+		"auto-checkpoints": {
+			"type": "bool",
+			"name": "Auto checkpoints",
+			"description": "Place practice checkpoints automatically after about 0.8-1.2 s of safe progress, or right after clearing a portal or orb.",
+			"default": true
+		},
+		"max-failures": {
+			"type": "int",
+			"name": "Failures before backtracking",
+			"description": "When a checkpoint collects more deaths than this, it is treated as a doomed spot: the solver deletes it and goes back to the previous checkpoint.",
+			"default": 35,
+			"min": 10,
+			"max": 200,
+			"control": {
+				"arrows": true,
+				"slider": false
+			}
+		},
+		"reactive-assist": {
+			"type": "bool",
+			"name": "Jump assist",
+			"description": "In cube and robot mode, try a window-centered jump over spikes the solver can already see, so fewer deaths are needed. The search still fixes any mistakes.",
+			"default": true
+		},
+		"block-manual-input": {
+			"type": "bool",
+			"name": "Ignore my clicks while solving",
+			"description": "While the solver is on, your own clicks are ignored so they don't end up in your macro.",
+			"default": true
+		},
+		"show-hud": {
+			"type": "bool",
+			"name": "Show status label",
+			"description": "Show the small status label in the top-right corner of the level.",
+			"default": true
+		}
+	}
+}
